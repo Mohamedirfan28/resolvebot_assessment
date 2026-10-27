@@ -359,6 +359,11 @@ def _handle_write(
             kind="return",
             order_id=order_id,
             item_ids=item_ids,
+            item_names=[
+                item.get("name") or item["item_id"]
+                for item in order.get("items", [])
+                if item["item_id"] in item_ids
+            ],
             reason=reason,
             citations=list(citations),
             tool_name=name,

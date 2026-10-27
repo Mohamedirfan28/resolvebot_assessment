@@ -4,6 +4,7 @@ made here in Python, not by the language model.
 
 from __future__ import annotations
 
+import re
 from datetime import date
 
 from dateutil.relativedelta import relativedelta
@@ -25,17 +26,20 @@ class PolicyParameters:
         value = self.get(key)
         if value is None or not str(value).strip():
             raise KeyError(f"policy_parameters is missing {key!r}")
-        try:
-            return int(float(str(value).strip()))
-        except ValueError as exc:
-            raise KeyError(f"policy_parameters[{key!r}] is not a number: {value!r}") from exc
+        parsed = self.get_int(key)
+        if parsed is None:
+            raise KeyError(f"policy_parameters[{key!r}] is not a number: {value!r}")
+        return parsed
 
     def get_int(self, key: str) -> int | None:
         value = self.get(key)
         if value is None or not str(value).strip():
             return None
+        match = re.search(r"-?\d+(?:\.\d+)?", str(value))
+        if not match:
+            return None
         try:
-            return int(float(str(value).strip()))
+            return int(float(match.group(0)))
         except ValueError:
             return None
 
@@ -79,9 +83,10 @@ def _delivery_date(order: dict):
 
 
 def warranty_months(warranty_class: str | None, params: PolicyParameters) -> int:
-    if warranty_class == "standard":
+    normalized = str(warranty_class or "").lower()
+    if normalized == "standard":
         return params.require_int("standard_warranty_months")
-    if warranty_class == "extended":
+    if normalized == "extended":
         return params.require_int("extended_warranty_months")
     return 0
 
@@ -130,7 +135,7 @@ def evaluate_return(
 
     # Check 2: never-returnable products (gift cards, software licences).
     for item in items:
-        if item.get("returnable") == "no":
+        if str(item.get("returnable") or "").lower() == "no":
             return _error(
                 "NON_RETURNABLE",
                 f"{item.get('name', item['item_id'])} cannot be returned",
@@ -149,7 +154,7 @@ def evaluate_return(
     # Check 4: opened, unopened-only products, change of mind.
     if reason == "changed_mind":
         for item in items:
-            if item.get("opened") and item.get("returnable") == "unopened_only":
+            if item.get("opened") and str(item.get("returnable") or "").lower() == "unopened_only":
                 return _error(
                     "OPENED_NOT_RETURNABLE",
                     f"{item.get('name', item['item_id'])} was opened and can "
@@ -197,7 +202,7 @@ def evaluate_warranty(
 
     covered, expired, no_warranty = [], [], []
     for item in items:
-        if item.get("warranty_class") == "none" or not item.get("warranty_months"):
+        if str(item.get("warranty_class") or "").lower() == "none" or not item.get("warranty_months"):
             no_warranty.append(item)
         elif item.get("warranty_active"):
             covered.append(item)

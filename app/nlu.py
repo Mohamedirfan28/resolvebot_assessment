@@ -29,9 +29,14 @@ QUESTION_RE = re.compile(
     r"^(can i|could i|should i|do i|how do i|how can i|what|which|when|where|"
     r"is it|are they|am i|does|do you|will it|would it)\b"
 )
+IMPERATIVE_RE = re.compile(
+    r"^(please\s+)?(return|cancel|open|create|start|file|raise|send)\b"
+)
 
 CANCEL_WORDS = re.compile(r"\b(cancel|cancellation|cancelled)\b")
-RETURN_WORDS = re.compile(r"\b(return|returns|returning|send .{0,12}back|refund)\b")
+RETURN_WORDS = re.compile(
+    r"\b(return|returns|returning|returnable|send .{0,12}back|refund)\b"
+)
 WARRANTY_WORDS = re.compile(
     r"\b(warranty|guarantee|guaranteed|covered|coverage|claim)\b"
 )
@@ -142,11 +147,21 @@ def is_no(text: str) -> bool:
 
 def is_action_request(text: str) -> bool:
     normalized = normalize(text)
-    if not ACTION_RE.search(normalized):
-        return False
     if QUESTION_RE.match(normalized) and "please" not in normalized:
         return False
-    return True
+    if ACTION_RE.search(normalized):
+        return True
+    if IMPERATIVE_RE.match(normalized) and not normalized.startswith(
+        ("return policy", "returns policy", "cancellation policy", "refund policy")
+    ):
+        return True
+    return False
+
+
+def is_question(text: str) -> bool:
+    """True for a question, even when it does not start with a question word."""
+    normalized = normalize(text)
+    return "?" in (text or "") or bool(QUESTION_RE.match(normalized))
 
 
 def detect_reason(text: str) -> str | None:
@@ -229,6 +244,13 @@ def match_items(order: dict, text: str) -> list[dict]:
 def mentions_item_like(text: str) -> bool:
     tokens = set(re.findall(r"[a-z0-9-]+", normalize(text)))
     return bool(tokens & ITEMISH_WORDS) or bool(extract_item_ids(text))
+
+
+def mentions_product(text: str) -> bool:
+    """True when the message names an actual product, not just 'item'."""
+    tokens = set(re.findall(r"[a-z0-9-]+", normalize(text)))
+    generic = {"item", "product", "order"}
+    return bool(tokens & (ITEMISH_WORDS - generic)) or bool(extract_item_ids(text))
 
 
 def looks_off_topic(text: str) -> bool:

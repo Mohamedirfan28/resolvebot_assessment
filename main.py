@@ -9,6 +9,7 @@ or:
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from app import repository
@@ -23,10 +25,14 @@ from app.assistant import Assistant
 from app.config import Settings, get_settings
 from app.llm import polish
 from app.policy_search import PolicyIndex
+from app.schemas import ChatRequest, ChatResponse, ErrorResponse
 from app.sessions import SessionConflict, SessionStore
 from app.tools import ToolContext
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 
 @asynccontextmanager
@@ -97,7 +103,6 @@ def _process(
             "citations": result.citations,
             "tool_calls": result.tool_calls,
             "pending_confirmation": result.pending_confirmation,
-            "session_id": session_id,
         }
     except Exception:
         logging.getLogger("resolvebot").exception("chat request failed")
@@ -117,7 +122,12 @@ def _process(
             conn.close()
 
 
-@app.post("/chat")
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    response_model_exclude_none=True,
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+)
 async def chat(request: Request):
     customer_id = request.headers.get("X-Customer-Id")
     if not customer_id or not customer_id.strip():
@@ -129,27 +139,26 @@ async def chat(request: Request):
     except Exception:
         return _error(400, "Body must be valid JSON")
 
-    if not isinstance(body, dict):
-        return _error(400, "Body must be a JSON object")
+    try:
+        payload = ChatRequest.model_validate(body)
+    except ValidationError:
+        return _error(
+            400, "session_id and message are required non-empty strings"
+        )
 
-    session_id = body.get("session_id")
-    message = body.get("message")
-    if not isinstance(session_id, str) or not session_id.strip():
-        return _error(400, "session_id is required")
-    if not isinstance(message, str) or not message.strip():
-        return _error(400, "message is required")
-
-    status, payload = await run_in_threadpool(
+    status, result = await run_in_threadpool(
         _process,
         request.app.state.settings,
         request.app.state.index,
         request.app.state.sessions,
         request.app.state.assistant,
         customer_id,
-        session_id.strip(),
-        message,
+        payload.session_id,
+        payload.message,
     )
-    return _json(status, payload)
+    if status == 200:
+        return result
+    return _json(status, result)
 
 
 @app.get("/health")

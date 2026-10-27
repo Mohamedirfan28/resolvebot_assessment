@@ -6,6 +6,7 @@ Run:  python -m unittest discover -s tests -v
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import sqlite3
 import tempfile
@@ -71,6 +72,22 @@ class ChatApiTests(unittest.TestCase):
         self.assertIn("3 July 2026", body["answer"])
         self.assertEqual(body["tool_calls"][0]["name"], "get_orders")
 
+    def test_response_has_exactly_the_required_fields(self):
+        body = self.chat("Where is order SS-10512?", session="shape").json()
+        self.assertEqual(
+            set(body),
+            {
+                "request_id",
+                "answer",
+                "route",
+                "citations",
+                "tool_calls",
+                "pending_confirmation",
+            },
+        )
+        self.assertEqual(body["route"], "answer")
+        self.assertTrue(body["request_id"])
+
     def test_missing_header(self):
         response = self.client.post(
             "/chat", json={"session_id": "x", "message": "hi"}
@@ -121,6 +138,115 @@ class ChatApiTests(unittest.TestCase):
         self.assertEqual(body["route"], "answer")
         self.assertIn("returns_policy", [c["doc_id"] for c in body["citations"]])
         self.assertIn("§2.1", [c["section"] for c in body["citations"]])
+
+    def test_cancellation_policy_question_is_not_an_action(self):
+        body = self.chat(
+            "Can I cancel my order after it has shipped?", session="policy2"
+        ).json()
+        self.assertEqual(body["route"], "answer")
+        self.assertIn(
+            "order_cancellation", [c["doc_id"] for c in body["citations"]]
+        )
+        self.assertFalse(body["pending_confirmation"])
+        self.assertEqual(
+            [call["name"] for call in body["tool_calls"]], ["search_policy"]
+        )
+
+    def test_return_after_window_policy_question(self):
+        body = self.chat(
+            "Can I return an item after the return window?", session="policy3"
+        ).json()
+        self.assertEqual(body["route"], "answer")
+        self.assertIn("returns_policy", [c["doc_id"] for c in body["citations"]])
+        self.assertFalse(body["pending_confirmation"])
+
+    def test_general_gift_card_question_is_policy(self):
+        body = self.chat("Can I return a gift card?", session="policy5").json()
+        self.assertEqual(body["route"], "answer")
+        self.assertIn("returns_policy", [c["doc_id"] for c in body["citations"]])
+        self.assertIn("gift card", body["answer"].lower())
+        self.assertFalse(body["pending_confirmation"])
+        self.assertNotIn(
+            "create_return_request", [call["name"] for call in body["tool_calls"]]
+        )
+
+    def test_general_earbud_question_is_policy(self):
+        body = self.chat("Are earbuds returnable?", session="policy6").json()
+        self.assertEqual(body["route"], "answer")
+        self.assertIn("returns_policy", [c["doc_id"] for c in body["citations"]])
+        self.assertFalse(body["pending_confirmation"])
+        self.assertEqual(
+            [call["name"] for call in body["tool_calls"]], ["search_policy"]
+        )
+
+    def test_tracking_how_to_uses_the_faq(self):
+        body = self.chat("How do I track my order?", session="policy4").json()
+        self.assertEqual(body["route"], "answer")
+        self.assertIn("faq_general", [c["doc_id"] for c in body["citations"]])
+        self.assertNotIn("get_orders", [call["name"] for call in body["tool_calls"]])
+
+    def test_ambiguous_item_remembers_the_product(self):
+        body = self.chat(
+            "I want to return my charger.", customer="C1024", session="amb1"
+        ).json()
+        self.assertEqual(body["route"], "clarify")
+
+        # Choosing the order should reuse "charger" from the previous message,
+        # so only the reason is still missing.
+        body = self.chat("SS-10471", customer="C1024", session="amb1").json()
+        self.assertEqual(body["route"], "clarify")
+        self.assertIn("Voltix 65W USB-C Charger", body["answer"])
+        self.assertNotIn("Which item", body["answer"])
+        self.assertIn("change of mind", body["answer"])
+
+        body = self.chat("changed my mind", customer="C1024", session="amb1").json()
+        self.assertTrue(body["pending_confirmation"])
+        call = body["tool_calls"][-1]
+        self.assertEqual(call["name"], "create_return_request")
+        self.assertEqual(call["args"]["item_ids"], ["SS-10471-1"])
+
+    def test_yes_with_changed_items_makes_a_new_proposal(self):
+        before = self.count("return_requests")
+        body = self.chat(
+            "Please return SS-10471-1 and SS-10471-2, I changed my mind.",
+            customer="C1024",
+            session="amb2",
+        ).json()
+        self.assertTrue(body["pending_confirmation"])
+        self.assertEqual(
+            body["tool_calls"][-1]["args"]["item_ids"],
+            ["SS-10471-1", "SS-10471-2"],
+        )
+        self.assertEqual(self.count("return_requests"), before)
+
+        body = self.chat(
+            "Yes, just the charger", customer="C1024", session="amb2"
+        ).json()
+        self.assertTrue(body["pending_confirmation"])
+        self.assertEqual(
+            body["tool_calls"][-1]["args"]["item_ids"], ["SS-10471-1"]
+        )
+        self.assertEqual(self.count("return_requests"), before)
+
+        confirmed = self.chat("yes", customer="C1024", session="amb2").json()
+        self.assertFalse(confirmed["pending_confirmation"])
+        self.assertEqual(self.count("return_requests"), before + 1)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            item_ids = conn.execute(
+                "SELECT item_ids FROM return_requests ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(json.loads(item_ids), ["SS-10471-1"])
+
+    def test_invalid_field_types_return_400(self):
+        response = self.client.post(
+            "/chat",
+            headers={"X-Customer-Id": "C1009"},
+            json={"session_id": "bad-type", "message": 123},
+        )
+        self.assertEqual(response.status_code, 400)
 
     def test_return_requires_confirmation_before_saving(self):
         before = self.count("return_requests")

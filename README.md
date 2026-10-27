@@ -62,6 +62,7 @@ present. See `.env.example`.
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` | empty | Provider key |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Server bind address |
 | `MAX_TOOL_CALLS` | `6` | Upper bound used by the planner flows |
+| `LOG_LEVEL` | `INFO` | Python logging level |
 
 `APP_TODAY` is the only source of "today" for business logic. The machine clock
 is used only for audit timestamps on inserted rows.
@@ -92,16 +93,20 @@ Response:
     {"name": "search_policy", "args": {"query": "return window days"}, "status": "success"},
     {"name": "create_return_request", "args": {"order_id": "SS-10458", "item_ids": ["SS-10458-1"], "reason": "changed_mind"}, "status": "pending_confirmation"}
   ],
-  "pending_confirmation": true,
-  "session_id": "s1"
+  "pending_confirmation": true
 }
 ```
+
+The response contains exactly these six fields: `request_id`, `answer`, `route`,
+`citations`, `tool_calls`, `pending_confirmation`. Bodies are validated with
+Pydantic (`app/schemas.py`); the schema is also visible in `/docs`.
 
 Routes: `answer`, `clarify`, `no_answer`, `out_of_scope`.
 
 HTTP errors:
 
-- `400` — invalid JSON, or missing `session_id` / `message`
+- `400` — invalid JSON, missing/blank/non-string `session_id` or `message`,
+  or any other body validation failure
 - `401` — missing or unknown `X-Customer-Id`
 - `403` — the `session_id` belongs to another customer
 
@@ -114,6 +119,7 @@ Everything else, including "order not found", is a normal `200` reply.
 ```
 main.py                  FastAPI app, header/body validation, HTTP status codes
 app/config.py            environment settings
+app/schemas.py           Pydantic request/response/error models
 app/repository.py        SQLite access; every query filters by customer_id
 app/rules.py             return, warranty and cancellation rules (all numbers
                          come from policy_parameters)
@@ -325,12 +331,20 @@ All with `APP_TODAY=2026-07-01`.
 python -m unittest discover -s tests -v
 ```
 
+The suite currently runs **49 tests**, all passing. pytest can also collect the
+same `unittest` classes (`pytest -q`) if it is installed; it is not a runtime
+dependency.
+
 - `tests/test_rules.py` covers the day-30/day-31 boundary, opened earbuds,
   gift cards, missing delivery, warranty month-end (31 Jan → 28/29 Feb), the
   inclusive warranty end date, and cancellation states.
 - `tests/test_api.py` starts the app against a temporary copy of the database
-  and checks the response shape, 400/401/403, the exact not-found reply,
+  and checks the exact response field set, 400/401/403, policy-only questions,
+  clarification memory, changed-item confirmation, the exact not-found reply,
   "nothing saved before yes", and the main flows.
+- `tests/test_custom_parameters.py` proves that return decisions follow
+  `policy_parameters` in the database (12 days eligible, 9 days expired) rather
+  than a hard-coded window.
 - `tests/test_agent.py` drives the optional LLM loop with a scripted provider
   (no network) and checks that it cites only retrieved sections, never writes
   before a yes, refuses an ineligible return, hides foreign orders, falls back

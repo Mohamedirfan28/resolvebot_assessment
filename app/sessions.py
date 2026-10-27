@@ -20,6 +20,7 @@ class Proposal:
     kind: str                      # return | warranty | cancellation
     order_id: str
     item_ids: list[str] = field(default_factory=list)
+    item_names: list[str] = field(default_factory=list)
     reason: str | None = None
     summary: str = ""
     citations: list[dict] = field(default_factory=list)
