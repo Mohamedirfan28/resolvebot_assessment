@@ -1,8 +1,29 @@
-.env
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .pytest_cache/
 .venv/
 venv/
+env/
+
+# Local configuration and secrets
+.env
+*.key
+
+# Local database copies created by tests or experiments
+*.db-journal
+*.db-wal
+*.db-shm
+tmp/
+.tmp/
+
+# Supplied assessment data: keep locally, do not commit
 data/
 TASK.pdf
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

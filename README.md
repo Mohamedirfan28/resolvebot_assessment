@@ -1,359 +1,432 @@
-# ResolveBot — ShopSphere support assistant
+# ResolveBot
 
-A small FastAPI service that handles customer-support chats for the fictional
-ShopSphere store. It can look up a customer's orders, answer policy questions
-with citations, check return eligibility, and create return requests or support
-tickets **only after the customer confirms**.
+ResolveBot is a FastAPI customer-support assistant for **ShopSphere**, a fictional
+electronics store. It exposes a single chat endpoint on port 8000. Customers can
+track orders, ask policy questions, check return eligibility, and request returns,
+warranty tickets or cancellation tickets. Every write is proposed first and saved
+only after the customer says yes.
 
-- Python 3.10+
-- One command to start: `uvicorn main:app --port 8000`
-- No UI, no Docker, no database migration
-- Business decisions (dates, eligibility, warranty) are made in Python from
-  `policy_parameters`, never by the language model
+The service is deterministic by default, so it can be tested without an API key.
+An optional LLM tool loop can be enabled with OpenAI, Anthropic or Google Gemini.
 
 ---
 
-## 1. Quick start
+## Quick start
 
-```bash
+Requirements: Python 3.10 or newer (the implementation was developed against
+Python 3.12), and the supplied `data/` folder in the project root. The folder is
+listed in `.gitignore` because the assessment asks candidates not to commit it;
+keep the supplied copy locally when running.
+
+```powershell
+# from the repository root (the folder containing main.py)
 python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS/Linux: source .venv/bin/activate
+.venv\Scripts\Activate.ps1          # Windows PowerShell
+# source .venv/bin/activate          # macOS / Linux
 
 pip install -r requirements.txt
-
-# The assessment data/ folder must sit next to main.py.
-cp .env.example .env          # optional; the defaults already point at ./data
-
 uvicorn main:app --port 8000
 ```
 
-Health check: `GET http://127.0.0.1:8000/health`.
+Open `http://127.0.0.1:8000/health` to confirm startup. Interactive API docs are
+at `http://127.0.0.1:8000/docs`.
 
-A request:
+You can also run `python main.py`; it reads `HOST` and `PORT` from the
+environment (defaults `0.0.0.0:8000`).
+
+### Configuration
+
+Copy `.env.example` to `.env` if you want to override anything. Real environment
+variables take precedence over `.env`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `POLICIES_PATH` | `./data/policies.md` | Policy Markdown file |
+| `MANIFEST_PATH` | `./data/manifest.json` | Document status/effective-date manifest |
+| `DB_PATH` | `./data/shopsphere.db` | SQLite database |
+| `APP_TODAY` | `2026-07-01` | Business "today"; the machine clock is never used |
+| `LLM_PROVIDER` | `none` | `none`, `openai`, `anthropic` or `google` |
+| `LLM_AGENT` | `auto` | `auto`, `always` or `never` |
+| `LLM_MODEL` | provider default | Model name override |
+| `LLM_BASE_URL` | provider default | OpenAI-compatible base URL override |
+| `<PROVIDER>_API_KEY` | empty | For example `OPENAI_API_KEY` |
+| `LLM_API_KEY` | empty | Generic fallback key name |
+| `MAX_TOOL_CALLS` | `6` | Per-message tool budget |
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | Server binding |
+| `LOG_LEVEL` | `INFO` | Logging threshold |
+
+With `LLM_PROVIDER=none` (the default), the deterministic planner handles every
+message. No network access and no key are required.
+
+---
+
+## API
+
+```http
+POST /chat
+X-Customer-Id: C1009
+Content-Type: application/json
+
+{"session_id": "s1", "message": "Where is order SS-10512?"}
+```
+
+```json
+{
+  "request_id": "e7191acb-fba1-4ec0-bf82-fceebd856372",
+  "answer": "Order SS-10512 is in transit with SwiftPost Logistics. The estimated delivery date is 3 July 2026. Tracking number: SWP311402977.",
+  "route": "answer",
+  "citations": [],
+  "tool_calls": [
+    {"name": "get_orders", "args": {"order_id": "SS-10512"}, "status": "success"}
+  ],
+  "pending_confirmation": false,
+  "session_id": "smoke-live-1"
+}
+```
+
+Routes are `answer`, `clarify`, `no_answer` and `out_of_scope`. HTTP 400, 401 and
+403 are reserved for malformed bodies, missing/unknown customers and sessions
+owned by another customer. Business failures such as an unknown order are still
+HTTP 200 with `route: "no_answer"`.
+
+The full contract is in [`docs/api_specification.md`](docs/api_specification.md).
+
+---
+
+## How it works
+
+### Request flow
+
+1. `app/api/routes/chat.py` validates the header and JSON body.
+2. A per-request SQLite connection is opened and the customer is verified.
+3. The in-memory session store returns the session, rejecting cross-customer
+   session IDs with HTTP 403.
+4. The assistant handles the turn: it detects intents, resolves the order and
+   items, calls the five tools, applies the business rules and writes the reply.
+5. The route, citations, tool-call log and pending-confirmation flag are returned.
+
+Each tool call appears in `tool_calls` in execution order. A proposed write is
+logged with status `pending_confirmation`; after a confirmed write it is logged
+with status `success`.
+
+### The five tools
+
+The tools live in `app/services/tools.py`. Their names match the brief exactly.
+
+| Tool | Type | Behaviour |
+|---|---|---|
+| `get_orders` | read | Customer-scoped orders, items, delivery details, days since delivery and warranty end dates |
+| `search_policy` | read | BM25 search over current, effective policy sections; returns `doc_id` and `section` |
+| `check_return_eligibility` | read | Runs the ordered return checks and returns `eligible` or an error code |
+| `create_return_request` | write | Re-checks eligibility, then inserts one `return_requests` row with status `requested` |
+| `create_support_ticket` | write | Re-checks warranty or cancellation rules, then inserts one `support_tickets` row with status `open` |
+
+The customer identity always comes from `X-Customer-Id`. No tool accepts a
+customer ID argument, and every order lookup is filtered by the authenticated
+customer. A missing order and another customer's order return the same
+`ORDER_NOT_FOUND` result.
+
+### Business rules
+
+`app/services/rules.py` owns every decision. It reads all limits from the
+`policy_parameters` table at request time, so a replacement database with
+different numbers changes behaviour without code changes.
+
+Return checks run in the required order:
+
+1. Order exists, belongs to the customer, items belong to the order, order was
+   delivered.
+2. Product `returnable` is not `no`.
+3. Days since delivery is within `return_window_days`, inclusive of the final day.
+4. For `changed_mind` only: an opened product marked `unopened_only` fails.
+
+Warranty ends the same calendar day N months after delivery, using
+`dateutil.relativedelta` (month-end dates clamp correctly). The final day is
+covered. Cancellation is allowed only while the order status is `processing`.
+Writes re-run the same checks immediately before inserting, so a stale proposal
+cannot bypass the rules.
+
+### Policy search (RAG)
+
+`app/services/policy_search.py` parses `policies.md` into documents, then into
+numbered sections such as `§2.1`. The manifest is matched by `doc_id` and
+controls `status`, `doc_type` and `effective_date`.
+
+- Superseded documents are never returned.
+- Documents effective after `APP_TODAY` are excluded from normal answers. A
+  future-dated shipping-fee change can be mentioned as a clearly labelled future
+  note with its start date when the question is about money.
+- Retrieval is BM25 with light stemming, stop-word removal, phrase matching and a
+  minimum query-term coverage threshold. A small preference keeps an
+  authoritative policy above the FAQ when both answer the same question.
+- Answers quote the selected section and cite only the documents actually used.
+
+The policy index is built once at startup. It currently loads 66 sections from
+the ten supplied documents.
+
+### Propose, then confirm
+
+Conversations are keyed by the caller-supplied `session_id` and are held in
+memory. A session may have one waiting proposal.
+
+1. An explicit action request produces a proposal (`pending_confirmation: true`).
+   The write tool appears in `tool_calls` with status `pending_confirmation`, and
+   no row is inserted.
+2. Only the very next message can confirm. A clear yes runs the write and returns
+   status `success`.
+3. "No", a changed detail, or any unrelated message abandons the proposal. A
+   changed detail starts a fresh proposal. Questions such as "where is my other
+   order?" are answered normally instead of being mistaken for a confirmation.
+4. A question such as "can I return this?" answers the question and offers the
+   action; saying yes to the offer creates a proposal, never an immediate write.
+
+### Optional LLM agent
+
+When `LLM_PROVIDER` and an API key are configured (and `LLM_AGENT` is `auto` or
+`always`), `app/services/agent.py` runs a provider-neutral tool loop:
+
+- The model chooses among the same five tools.
+- Read tools execute normally; citations are taken only from sections returned by
+  `search_policy` in that turn.
+- Write tools are intercepted. Python re-validates the request and converts it
+  into a waiting proposal. The model never writes a row directly.
+- The confirmation turn is handled by the deterministic planner, which re-checks
+  the rules before writing.
+- Provider errors, malformed tool calls and tool-budget exhaustion fall back
+  safely ("nothing has been saved" or the deterministic planner).
+
+Temperature is set to 0 for all providers.
+
+### Testing a real provider
+
+1. Add the key to `.env` (or set it in the shell). `.env` is git-ignored.
+
+```dotenv
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+LLM_AGENT=always
+# Optional; otherwise the provider default is used.
+LLM_MODEL=gpt-4o-mini
+LOG_LEVEL=INFO
+```
+
+For the other providers:
+
+```dotenv
+# Anthropic
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+LLM_MODEL=claude-3-5-haiku-latest
+
+# Google Gemini
+LLM_PROVIDER=google
+GOOGLE_API_KEY=...
+LLM_MODEL=gemini-1.5-flash
+```
+
+For an OpenAI-compatible local server, keep `LLM_PROVIDER=openai` and set
+`LLM_BASE_URL`, for example `http://127.0.0.1:1234/v1`.
+
+2. Stop the old server and restart it so the new environment is loaded.
+
+```powershell
+uvicorn main:app --port 8000
+```
+
+The startup log should include `LLM=openai` (or the provider you chose). A
+successful model answer also logs:
+
+```text
+LLM reply via openai: route=answer, tool_calls=2
+```
+
+If the provider call fails, the log contains `LLM agent failed; using
+deterministic planner` and the request still succeeds using the local planner.
+
+3. Exercise a read, a policy question, and a write proposal.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/chat \
   -H "Content-Type: application/json" \
   -H "X-Customer-Id: C1009" \
-  -d '{"session_id":"s1","message":"Where is order SS-10512?"}'
+  -d '{"session_id":"llm-1","message":"Where is order SS-10512?"}'
+
+curl -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "X-Customer-Id: C1009" \
+  -d '{"session_id":"llm-2","message":"How many days do I have to return something?"}'
+
+curl -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "X-Customer-Id: C1009" \
+  -d '{"session_id":"llm-3","message":"Return the speaker from SS-10458, I changed my mind."}'
 ```
 
-`python main.py` also works and reads `HOST`/`PORT`.
+For the third request, confirm that:
+
+- `pending_confirmation` is `true`;
+- the last `tool_calls` entry is `create_return_request` with status
+  `pending_confirmation`;
+- no row exists yet in `return_requests`.
+
+Only send `"yes"` as the next message; the deterministic confirmation path then
+writes the row. This verifies that the model can choose tools without being
+allowed to bypass the yes-step.
+
+If you want to force the deterministic path for comparison, set
+`LLM_AGENT=never` and restart.
 
 ---
 
-## 2. Configuration
+## Assumptions
 
-All settings come from environment variables; a local `.env` is loaded if
-present. See `.env.example`.
+- `APP_TODAY` is the single source of "today". The wall clock is used only to
+  timestamp saved rows.
+- `session_id` is opaque and chosen by the caller. Separate processes do not share
+  in-memory sessions; a restart starts new conversations.
+- A missing header, unknown customer or malformed body is an HTTP error, not a
+  chat reply.
+- "Clear yes" means a short affirmative such as yes, yeah, sure, confirm, go
+  ahead or please do. "Just do it" alone is not treated as confirmation.
+- One proposal waits at a time. Any message other than a clear yes abandons it.
+- A date without a year is interpreted as 2026 by the supplied data and policy
+  text; `APP_TODAY` governs all rule calculations.
+- Future-dated documents are mentioned only as future changes. They are never
+  cited as current rules.
+- `return_requests.item_ids` is stored as a JSON array because the supplied table
+  defines it as text.
+- The deterministic planner is the reference implementation. The optional LLM
+  path is an add-on, not a dependency.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `POLICIES_PATH` | `./data/policies.md` | Policy Markdown |
-| `MANIFEST_PATH` | `./data/manifest.json` | Document metadata |
-| `DB_PATH` | `./data/shopsphere.db` | SQLite database |
-| `APP_TODAY` | `2026-07-01` | The date the rules treat as today |
-| `LLM_PROVIDER` | `none` | `none`, `openai`, `anthropic`, `google` |
-| `LLM_MODEL` | provider default | Model name for the agent loop / polish pass |
-| `LLM_BASE_URL` | provider default | OpenAI-compatible base URL |
-| `LLM_AGENT` | `0` | Set `1` for the real LLM tool loop (needs a provider key) |
-| `LLM_POLISH` | `0` | Set `1` to let the LLM rephrase final answers when the agent loop is off |
-| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GOOGLE_API_KEY` | empty | Provider key |
-| `HOST` / `PORT` | `0.0.0.0` / `8000` | Server bind address |
-| `MAX_TOOL_CALLS` | `6` | Upper bound used by the planner flows |
-| `LOG_LEVEL` | `INFO` | Python logging level |
+## What does not work / limitations
 
-`APP_TODAY` is the only source of "today" for business logic. The machine clock
-is used only for audit timestamps on inserted rows.
+- **No live LLM key was available during development.** The optional provider
+  loop is covered by a scripted fake provider (tool calls, write interception,
+  confirmation and fallback), but the real OpenAI/Anthropic/Google HTTP calls were
+  not exercised against a live endpoint.
+- Sessions are in-memory and process-local. They are not persisted, shared across
+  workers, or evicted except when the process exits. The store is protected by a
+  lock but is not a distributed cache.
+- Retrieval is lexical BM25, not embeddings. It handles the supplied policy
+  vocabulary well, but unusual paraphrases can return no result rather than a
+  best guess. No result deliberately becomes `no_answer`.
+- Conversation understanding is rule-based in deterministic mode. Very unusual
+  phrasing may need a clarification turn, especially item descriptions.
+- There is no authentication beyond trusting `X-Customer-Id` (the brief assumes
+  an already logged-in customer), no rate limiting and no UI.
+- Refund amounts, emails, human hand-off and exchanges are explicitly out of
+  scope.
+
+## Tests
+
+The suite uses pytest and FastAPI's test client. Every test copies
+`data/shopsphere.db` to a pytest temporary directory, so the supplied database is
+never modified.
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Current result: **83 passed** across business rules, policy retrieval, tools,
+HTTP contract, conversation safety and the optional agent path.
+
+| Test file | Focus |
+|---|---|
+| `tests/test_business_rules.py` | Return order of checks, inclusive day 30, warranty month-end, cancellation |
+| `tests/test_policy_search.py` | Manifest filtering, superseded/future documents, citations, coverage |
+| `tests/test_tools.py` | Owner scoping, error codes, writes and re-checks |
+| `tests/test_api_contract.py` | Response shape and 400/401/403 behaviour |
+| `tests/test_conversation.py` | Clarification, propose/confirm, no-write safety, combined intents |
+| `tests/test_agent.py` | Scripted LLM loop, write interception, fallback |
+
+Manual smoke test performed with a live uvicorn process:
+
+```text
+GET  /health -> {"status":"ok","policy_sections":66,"app_today":"2026-07-01"}
+POST /chat   -> tracking answer for SS-10512, route "answer", one get_orders call
+```
+
+## Example conversations
+
+```text
+C1009: Where is order SS-10512?
+Bot:   Order SS-10512 is in transit with SwiftPost Logistics. The estimated
+       delivery date is 3 July 2026. Tracking number: SWP311402977.
+
+C1009: Return the speaker from SS-10458, I changed my mind.
+Bot:   You can return Nimbra Smart Speaker from order SS-10458. It was delivered
+       on 21 June 2026 (10 days ago), which is within the 30-day return window.
+       Shall I go ahead and create the return request?
+                                      [pending_confirmation: true]
+
+C1009: Yes
+Bot:   Done - the return request has been created for order SS-10458. Your
+       reference is <uuid>. [create_return_request: success]
+```
+
+```text
+C1024: I want to return my charger.
+Bot:   Which order do you mean? SS-10471, SS-10489 and SS-10503 all contain
+       chargers. [route: clarify]
+
+C1024: The 65W one, I changed my mind.
+Bot:   It was delivered ... within the return window. Shall I create the return
+       request?
+```
+
+```text
+C1011: Can I return the opened earbuds? I changed my mind.
+Bot:   Auralis Buds Air has been opened. In-ear earphones and earbuds can be
+       returned only if the hygiene seal is unbroken ... [no proposal]
+```
+
+```text
+C1009: What's the weather in Mumbai?
+Bot:   I can help with ShopSphere orders and policies ... [route: out_of_scope]
+```
+
+## Project layout
+
+```text
+main.py                       Uvicorn entry point
+app/
+  main.py                     FastAPI app factory and lifespan
+  api/routes/chat.py          POST /chat and HTTP error contract
+  api/routes/health.py        GET /health
+  core/config.py              Environment settings and .env loader
+  core/logging.py             Logging setup
+  db/repository.py            SQLite queries and inserts
+  schemas/chat.py             Pydantic request/response models
+  services/
+    nlu.py                    Intent, item and message helpers
+    rules.py                  Return, warranty and cancellation rules
+    policy_search.py          Markdown parsing, manifest filtering, BM25
+    tools.py                  The five tools with owner scoping
+    sessions.py               Session store and proposal state
+    assistant.py              Deterministic planner and reply writer
+    agent.py                  Optional LLM tool loop
+tests/                        Pytest suite with temporary database copies
+data/                         Supplied inputs (do not edit)
+docs/                         Requirements, architecture, API and report
+```
+
+## Where AI coding assistants were used
+
+AI coding assistants were used to help scaffold the implementation, generate the
+test suite and draft documentation. All business rules, safety behaviour and
+tests were reviewed and exercised locally. The deterministic planner was chosen
+so the safety-critical path can be explained and verified without a model.
 
 ---
 
-## 3. API
+## Documentation
 
-### `POST /chat`
-
-Headers: `X-Customer-Id`, `Content-Type: application/json`.
-
-```json
-{"session_id": "s1", "message": "Return the speaker from SS-10458, I changed my mind."}
-```
-
-Response:
-
-```json
-{
-  "request_id": "5d1e...",
-  "answer": "You can return Nimbra Smart Speaker from order SS-10458. ...",
-  "route": "answer",
-  "citations": [{"doc_id": "returns_policy", "section": "§2.1"}],
-  "tool_calls": [
-    {"name": "get_orders", "args": {"order_id": "SS-10458"}, "status": "success"},
-    {"name": "check_return_eligibility", "args": {"order_id": "SS-10458", "item_ids": ["SS-10458-1"], "reason": "changed_mind"}, "status": "success"},
-    {"name": "search_policy", "args": {"query": "return window days"}, "status": "success"},
-    {"name": "create_return_request", "args": {"order_id": "SS-10458", "item_ids": ["SS-10458-1"], "reason": "changed_mind"}, "status": "pending_confirmation"}
-  ],
-  "pending_confirmation": true
-}
-```
-
-The response contains exactly these six fields: `request_id`, `answer`, `route`,
-`citations`, `tool_calls`, `pending_confirmation`. Bodies are validated with
-Pydantic (`app/schemas.py`); the schema is also visible in `/docs`.
-
-Routes: `answer`, `clarify`, `no_answer`, `out_of_scope`.
-
-HTTP errors:
-
-- `400` — invalid JSON, missing/blank/non-string `session_id` or `message`,
-  or any other body validation failure
-- `401` — missing or unknown `X-Customer-Id`
-- `403` — the `session_id` belongs to another customer
-
-Everything else, including "order not found", is a normal `200` reply.
-
----
-
-## 4. How the code is organised
-
-```
-main.py                  FastAPI app, header/body validation, HTTP status codes
-app/config.py            environment settings
-app/schemas.py           Pydantic request/response/error models
-app/repository.py        SQLite access; every query filters by customer_id
-app/rules.py             return, warranty and cancellation rules (all numbers
-                         come from policy_parameters)
-app/policy_search.py     splits policies.md, filters by manifest, BM25 search
-app/tools.py             the five tools + tool-call log
-app/agent.py             optional LLM tool loop (LLM_AGENT=1)
-app/nlu.py               deterministic intent / order / item / reason parsing
-app/assistant.py         conversation planner, clarification, propose/confirm
-app/assistant_types.py   shared reply dataclass
-app/sessions.py          per-session memory (messages, one pending proposal)
-app/llm.py               optional answer-polish pass
-tests/                   rule tests and HTTP tests
-```
-
-### The five tools
-
-`get_orders`, `search_policy`, `check_return_eligibility`,
-`create_return_request`, `create_support_ticket` — with the exact inputs from
-the brief. Every tool takes the customer ID from the request context, never from
-the message. An order that is missing and an order that belongs to another
-customer both return `ORDER_NOT_FOUND`, so existence cannot be probed.
-
-`get_orders` adds `delivery_date`, `days_since_delivery`, and per item
-`warranty_end` / `warranty_active`. Writes re-run the rule check immediately
-before inserting.
-
-### Return check order
-
-1. order exists, belongs to the caller, items belong to the order → `ORDER_NOT_FOUND` / `INVALID_ITEM`
-2. order delivered → `NOT_DELIVERED`
-3. product is not `no` → `NON_RETURNABLE`
-4. `days_since_delivery <= return_window_days` → `RETURN_WINDOW_EXPIRED`
-5. opened + `changed_mind` + `unopened_only` → `OPENED_NOT_RETURNABLE`
-
-Day 30 is allowed; day 31 is not. Warranty ends on the same calendar day N
-months later (month-end handled with `dateutil.relativedelta`) and that last day
-is still covered.
-
-### Policy search
-
-`policies.md` is split at each top-level `#` document, then into `### §x.y`
-sections. A section is only searchable if the manifest says `status: current`
-and `effective_date <= APP_TODAY`. Superseded documents (including the 2024
-returns policy) are excluded at index time; future documents are kept in a
-separate list so the assistant can mention a later change with its start date.
-Ranking is a small BM25 index with title/heading boosts. Answers quote the
-retrieved paragraph and cite only the documents used.
-
-### Propose, then do
-
-A write tool is never called in the same turn as the proposal. The proposal is
-stored in the session with `pending_confirmation: true`, and the pending tool
-call is shown with status `pending_confirmation`. Only a clear yes in the very
-next message executes it. "No", a new topic, or changed details clear the
-proposal. A changed detail ("just the power bank") starts a new proposal for the
-same order. A session holds at most one waiting proposal.
-
-### Optional LLM tool loop
-
-The deterministic planner is the default. Setting `LLM_AGENT=1` together with
-`LLM_PROVIDER` and a provider key switches normal turns to a real tool loop:
-the message plus the five tool schemas go to the model, requested tools are
-executed, their results are sent back, and this repeats until the model writes
-a final reply or `MAX_TOOL_CALLS` is reached. OpenAI-compatible chat
-completions, the Anthropic Messages API and the Google `generateContent` API
-are supported, all at temperature 0.
-
-Safety stays in Python, outside the prompt:
-
-- `create_return_request` and `create_support_ticket` are **intercepted**. The
-  arguments are validated against the same rule functions, and an eligible
-  action becomes a waiting proposal. The loop never inserts a row.
-- The customer's yes is still handled by the deterministic path, which re-runs
-  the rule check and only then calls the write tool.
-- A missing or foreign order short-circuits to the exact
-  `I couldn't find that order on your account.` reply with `no_answer` and no
-  citations.
-- Citations returned by the model are filtered to sections that `search_policy`
-  actually returned in that turn.
-- A provider error or timeout falls back to the deterministic planner for that
-  message, with no partial tool log.
-
-With `LLM_AGENT=0` (the default), `app/agent.py` is never called.
-
----
-
-## 5. Assumptions
-
-- **Reason is required for a return.** `changed_mind` and `defective` change the
-  outcome (opened earbuds), so if the customer does not say which, the assistant
-  asks instead of guessing.
-- **A question is not an action.** "Can I return it?" gets an answer plus an
-  offer; "please return it" gets a proposal. A yes to an explicit offer executes
-  the action, because the offer already described exactly what will happen.
-- **Ambiguity is never guessed.** If the same product appears in several orders,
-  or an order has several matching items, the assistant lists them and asks.
-  The clarifying context is remembered, so a short follow-up ("SS-10471",
-  "the charger", "changed my mind") continues the same flow.
-- **Delivered** means `shipments.delivered_at` is set. No delivery timestamp is
-  treated as `NOT_DELIVERED`.
-- **Cancelling a delivered order** is refused. The tool returns
-  `ORDER_ALREADY_SHIPPED` because the brief's error-code list has no separate
-  "delivered" code.
-- **Future policy documents** are not applied. The shipping-fee update dated
-  2026-08-01 is mentioned only as a future change, and only for cost/fee
-  questions.
-- **Sessions are in memory**, keyed by `session_id`, and belong to the customer
-  who created them. Restarting the service clears chats.
-- **`data/` is not part of the submission.** The `.gitignore` excludes it; the
-  service expects the assessment copy to be present at runtime.
-- **No refund amount is calculated** and no exchanges are processed, per the
-  brief. The exchange policy can still be explained.
-
-## 6. What does not work / known limitations
-
-- **The tool-selection step is deterministic by default.** `LLM_AGENT=1`
-  enables the real tool loop described in section 4. That path is covered by
-  scripted-provider tests, but was not run against a live provider key in this
-  environment. The deterministic planner is what the example conversations and
-  the HTTP tests exercise. If a true LLM planner is required with no
-  configuration, this is the main deviation.
-- Intent parsing is keyword/pattern based. Very unusual phrasing may end in a
-  clarification instead of the intended flow. That is deliberate (ask rather
-  than guess), but it is a limitation.
-- Sessions are single-process and not persisted. Multiple uvicorn workers would
-  not share pending proposals.
-- There is no authentication beyond the `X-Customer-Id` header, which is what
-  the brief specifies.
-- The LLM agent and polish paths are optional. Both are covered by scripted
-  provider tests, but neither was exercised against a live provider key in this
-  environment; provider errors fall back to the deterministic text.
-- Multi-intent support covers tracking plus one other action in the same message.
-  Three or more separate requests in one message are not guaranteed.
-
-## 7. Example conversations
-
-All with `APP_TODAY=2026-07-01`.
-
-**Track**
-
-> C1009: Where is order SS-10512?
->
-> Bot: Order SS-10512 is in transit with SwiftPost Logistics. The estimated
-> delivery date is 3 July 2026. Tracking number: SWP311402977.
-
-**Return, propose then confirm**
-
-> C1009: I want to return the speaker from SS-10458, I changed my mind.
->
-> Bot: You can return Nimbra Smart Speaker from order SS-10458. It was delivered
-> on 21 June 2026 (10 days ago), which is within the 30-day return window. Shall
-> I go ahead and create the return request?
->
-> (`pending_confirmation: true`, `create_return_request` status
-> `pending_confirmation`, nothing in the database)
->
-> C1009: Yes, go ahead.
->
-> Bot: Done — the return request has been created for order SS-10458. Your
-> reference is ... (`create_return_request` status `success`)
-
-**Foreign / missing order**
-
-> C1009: Where is order SS-10530?
->
-> Bot: I couldn't find that order on your account.
->
-> (`route: no_answer`, `citations: []`, `get_orders` error `ORDER_NOT_FOUND`;
-> SS-10530 belongs to another customer)
-
-**Policy**
-
-> How many days do I have to return something?
->
-> Bot quotes `returns_policy §2.1` (30 days) and `§2.2` (how days are counted),
-> with citations.
-
-**Ambiguous item**
-
-> C1024: I want to return my charger.
->
-> Bot: I found that item in more than one order: SS-10503 (...); SS-10489 (...);
-> SS-10471 (...). Which order do you mean? Also, is this a change of mind, or is
-> the item defective?
->
-> C1024: SS-10471 → Bot asks which item in that order
-> C1024: the charger → Bot asks for the reason
-> C1024: changed my mind → Bot proposes the return
-
-**Opened earbuds**
-
-> C1011: Return the earbuds from SS-10505, I changed my mind.
->
-> Bot: ... cannot be returned for a change of mind because they were opened;
-> quotes `returns_policy §4.2`. A defective return is still possible.
-
-**Cancellation**
-
-> C1039: Please cancel order SS-10530. → proposal for a cancellation ticket
-> C1039: yes → ticket saved with status `open`
-
-**Off-topic**
-
-> Tell me a joke. → `out_of_scope`, empty citations and tool calls.
-
-## 8. Tests
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-The suite currently runs **49 tests**, all passing. pytest can also collect the
-same `unittest` classes (`pytest -q`) if it is installed; it is not a runtime
-dependency.
-
-- `tests/test_rules.py` covers the day-30/day-31 boundary, opened earbuds,
-  gift cards, missing delivery, warranty month-end (31 Jan → 28/29 Feb), the
-  inclusive warranty end date, and cancellation states.
-- `tests/test_api.py` starts the app against a temporary copy of the database
-  and checks the exact response field set, 400/401/403, policy-only questions,
-  clarification memory, changed-item confirmation, the exact not-found reply,
-  "nothing saved before yes", and the main flows.
-- `tests/test_custom_parameters.py` proves that return decisions follow
-  `policy_parameters` in the database (12 days eligible, 9 days expired) rather
-  than a hard-coded window.
-- `tests/test_agent.py` drives the optional LLM loop with a scripted provider
-  (no network) and checks that it cites only retrieved sections, never writes
-  before a yes, refuses an ineligible return, hides foreign orders, falls back
-  on a provider error, and stops at the tool limit.
-
-## 9. Where AI coding assistants were used
-
-This solution was built with an AI coding assistant (OpenCode with a DeepSeek
-model) used for scaffolding, drafting the rule and retrieval modules, and
-writing the tests. The design choices, the rule ordering, the confirmation
-state machine and the verification against the supplied data were reviewed and
-run locally; the README's limitations are listed honestly above.
+- [`docs/requirements_analysis.md`](docs/requirements_analysis.md) - requirement
+  breakdown, assumptions and traceability
+- [`docs/architecture.md`](docs/architecture.md) - components, flows, data model
+  and safety invariants
+- [`docs/api_specification.md`](docs/api_specification.md) - request/response
+  schema, routes, errors and examples
+- [`docs/implementation_report.md`](docs/implementation_report.md) - delivery
+  summary, verification evidence and remaining limitations

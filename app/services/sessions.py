@@ -1,9 +1,4 @@
-"""In-memory chat sessions.
-
-Each session remembers its messages, one waiting proposal and one "soft offer"
-(the answer to a question like "can I return it?"). A session belongs to the
-customer who started it.
-"""
+"""In-memory chat sessions with one waiting proposal at a time."""
 
 from __future__ import annotations
 
@@ -12,24 +7,23 @@ from threading import Lock
 
 
 class SessionConflict(Exception):
-    """The session_id belongs to another customer."""
+    """The session_id belongs to a different customer."""
 
 
-@dataclass
+@dataclass(slots=True)
 class Proposal:
-    kind: str                      # return | warranty | cancellation
+    kind: str  # return | warranty | cancellation
     order_id: str
     item_ids: list[str] = field(default_factory=list)
     item_names: list[str] = field(default_factory=list)
     reason: str | None = None
     summary: str = ""
     citations: list[dict] = field(default_factory=list)
-    tool_name: str = ""            # create_return_request / create_support_ticket
+    tool_name: str = ""
     args: dict = field(default_factory=dict)
-    answer_hint: str = ""
 
 
-@dataclass
+@dataclass(slots=True)
 class Session:
     session_id: str
     customer_id: str
@@ -40,7 +34,8 @@ class Session:
 
     def remember(self, role: str, content: str) -> None:
         self.messages.append({"role": role, "content": content})
-        del self.messages[:-40]
+        if len(self.messages) > 40:
+            del self.messages[:-40]
 
 
 class SessionStore:
@@ -54,10 +49,14 @@ class SessionStore:
             if session is None:
                 session = Session(session_id=session_id, customer_id=customer_id)
                 self._sessions[session_id] = session
-            elif session.customer_id != customer_id:
+                return session
+            if session.customer_id != customer_id:
                 raise SessionConflict
             return session
 
     def clear(self) -> None:
         with self._lock:
             self._sessions.clear()
+
+    def __len__(self) -> int:
+        return len(self._sessions)

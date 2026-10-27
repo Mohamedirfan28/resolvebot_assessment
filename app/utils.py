@@ -1,4 +1,4 @@
-"""Small date/number/text helpers shared across the app."""
+"""Date and string helpers used by the rules and policy index."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import re
 from datetime import date, datetime
 
 
-def parse_date(value) -> date | None:
-    """Parse 'YYYY-MM-DD' or an ISO timestamp. Returns None when empty/bad."""
+def parse_date(value: object) -> date | None:
+    """Parse a date, or the date part of an ISO timestamp."""
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -23,20 +23,16 @@ def parse_date(value) -> date | None:
         return None
 
 
-def format_date(value) -> str:
-    """Format a date as '3 July 2026' (day without a leading zero)."""
+def format_date(value: object) -> str:
+    """Format as '3 July 2026' (no leading zero on the day)."""
     parsed = parse_date(value)
     if parsed is None:
         return ""
     return f"{parsed.day} {parsed.strftime('%B')} {parsed.year}"
 
 
-def days_between(start: date, end: date) -> int:
-    return (end - start).days
-
-
-def trim_sentences(text: str, max_chars: int = 420) -> str:
-    """Collapse whitespace and keep whole sentences up to roughly max_chars."""
+def trim_text(text: str, max_chars: int = 420) -> str:
+    """Collapse whitespace and keep whole sentences within a rough limit."""
     clean = re.sub(r"\s+", " ", text or "").strip()
     if len(clean) <= max_chars:
         return clean
@@ -44,8 +40,4 @@ def trim_sentences(text: str, max_chars: int = 420) -> str:
     stop = max(cut.rfind(". "), cut.rfind("; "), cut.rfind("! "))
     if stop >= 80:
         return cut[: stop + 1].strip()
-    return cut.rsplit(" ", 1)[0].strip() + "…"
-
-
-def money(amount: float) -> str:
-    return f"₹{amount:,.0f}"
+    return cut.rsplit(" ", 1)[0].strip() + "..."

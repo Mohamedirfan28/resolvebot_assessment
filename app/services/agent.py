@@ -1,18 +1,14 @@
-"""Optional LLM tool-calling loop.
+"""Optional LLM tool loop.
 
-This is off by default. Set ``LLM_AGENT=1`` together with a provider and API key
-to let the model choose tools. Python still owns every business decision:
+When an API key is configured (``LLM_AGENT=auto`` or ``always``), the model
+chooses among the same five tools and writes the final prose. Python still owns
+every business decision:
 
-* the model may only call the five real tools;
-* write tools are intercepted. ``create_return_request`` and
-  ``create_support_ticket`` are validated here and turned into a waiting
-  proposal; they are never executed in the same turn;
-* the confirmation ("yes") is handled by the deterministic assistant, which
-  re-runs the rule check before inserting;
+* write tools are intercepted and validated, then converted into a waiting
+  proposal; the loop never inserts a row;
+* the next clear "yes" is handled by the deterministic planner, which re-runs
+  the rule check before writing;
 * a provider error falls back to the deterministic planner.
-
-If no key is configured, or ``LLM_AGENT`` is unset, ``app.assistant`` never
-calls this module.
 """
 
 from __future__ import annotations
@@ -25,20 +21,21 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from . import nlu, rules
-from .assistant_types import ChatResult
-from .config import Settings
-from .sessions import Proposal, Session
-from .tools import ToolContext, ToolLimitExceeded
-from .util import format_date
+from app.services import nlu, rules
+from app.services.assistant import (
+    NOT_FOUND_ANSWER,
+    SUPPORT_EMAIL,
+    ChatResult,
+    _explain_error,
+)
+from app.services.sessions import Proposal, Session
+from app.services.tools import ToolContext, ToolLimitExceeded
+from app.utils import format_date
 
 logger = logging.getLogger("resolvebot.agent")
 
-NOT_FOUND_ANSWER = "I couldn't find that order on your account."
-SUPPORT_EMAIL = "support@shopsphere.example.com"
 ROUTES = {"answer", "clarify", "no_answer", "out_of_scope"}
 WRITE_TOOLS = {"create_return_request", "create_support_ticket"}
-
 DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-3-5-haiku-latest",
@@ -48,29 +45,35 @@ DEFAULT_MODELS = {
 
 @dataclass
 class LLMReply:
-    """One provider turn: some prose and/or tool calls."""
-
     text: str = ""
     tool_calls: list[dict] = field(default_factory=list)
 
 
-# --------------------------------------------------------------- tool schemas
 TOOL_SPECS = [
     {
         "type": "function",
         "function": {
             "name": "get_orders",
             "description": (
-                "Read the customer's own orders, with items, delivery date, days "
-                "since delivery and warranty dates. Both arguments are optional."
+                "Read the authenticated customer's own orders, including items, "
+                "delivery date, days since delivery and warranty end dates. "
+                "Both arguments are optional."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "order_id": {"type": "string", "description": "Order ID like SS-10458"},
+                    "order_id": {
+                        "type": "string",
+                        "description": "Order ID such as SS-10458",
+                    },
                     "status": {
                         "type": "string",
-                        "enum": ["processing", "shipped", "delivered", "cancelled"],
+                        "enum": [
+                            "processing",
+                            "shipped",
+                            "delivered",
+                            "cancelled",
+                        ],
                     },
                 },
                 "required": [],
@@ -82,13 +85,16 @@ TOOL_SPECS = [
         "function": {
             "name": "search_policy",
             "description": (
-                "Search the current, effective ShopSphere policy documents. "
-                "Returns matching paragraphs with doc_id and section for citation."
+                "Search current, effective ShopSphere policy documents. Returns "
+                "the best matching sections with doc_id and section for citation."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "What to look up"}
+                    "query": {
+                        "type": "string",
+                        "description": "What policy question to look up",
+                    }
                 },
                 "required": ["query"],
             },
@@ -99,15 +105,17 @@ TOOL_SPECS = [
         "function": {
             "name": "check_return_eligibility",
             "description": (
-                "Read-only check: can these items from this order be returned for "
-                "this reason? Returns eligible or an error code. Call before "
-                "proposing a return."
+                "Read-only return check. Returns eligible or an error code. Call "
+                "this before proposing a return."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "order_id": {"type": "string"},
-                    "item_ids": {"type": "array", "items": {"type": "string"}},
+                    "item_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "reason": {
                         "type": "string",
                         "enum": ["changed_mind", "defective"],
@@ -122,15 +130,18 @@ TOOL_SPECS = [
         "function": {
             "name": "create_return_request",
             "description": (
-                "Create a return request. Only call this when the customer clearly "
-                "asks for the action. The system will ask for confirmation; do not "
-                "tell the customer it is done."
+                "Create a return request. Only call when the customer clearly "
+                "asks for the action. The system will ask for confirmation; do "
+                "not claim it is done."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "order_id": {"type": "string"},
-                    "item_ids": {"type": "array", "items": {"type": "string"}},
+                    "item_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "reason": {
                         "type": "string",
                         "enum": ["changed_mind", "defective"],
@@ -145,9 +156,9 @@ TOOL_SPECS = [
         "function": {
             "name": "create_support_ticket",
             "description": (
-                "Open a warranty or cancellation ticket. Only call this when the "
+                "Open a warranty or cancellation ticket. Only call when the "
                 "customer clearly asks for the action. The system will ask for "
-                "confirmation; do not tell the customer it is done."
+                "confirmation; do not claim it is done."
             ),
             "parameters": {
                 "type": "object",
@@ -166,64 +177,51 @@ TOOL_SPECS = [
 ]
 
 
-def system_prompt(settings: Settings) -> str:
+def system_prompt(settings) -> str:
     today = format_date(settings.app_today)
     return f"""You are ResolveBot, the customer-support assistant for ShopSphere, \
 an online electronics store. Today is {today}.
 
-Rules you must follow:
-- Use the tools to read facts. Never invent an order, a date, a price, a \
-delivery status or a policy rule.
-- The customer's identity is fixed by the request header. Never ask for it and \
-never look up an order for anyone else.
-- When the customer asks about a policy, call search_policy first. Quote only \
-the paragraphs it returns and cite them as doc_id + section. If the current \
-policies do not answer the question, use route no_answer and suggest emailing \
-{SUPPORT_EMAIL}.
-- If a specific order the customer mentions is missing or belongs to someone \
-else, reply exactly: "{NOT_FOUND_ANSWER}" with route no_answer and no citations.
+Use the tools to read facts. Never invent an order, date, price, delivery status \
+or policy rule. The customer's identity is fixed by the request header; never ask \
+for it.
+
+Rules:
+- If a specific order is missing or belongs to someone else, reply exactly: \
+"{NOT_FOUND_ANSWER}" with route "no_answer" and no citations.
 - If the order, item or return reason is missing or unclear, ask for all missing \
-details in one message and use route clarify. If several orders or items match, \
-list them and ask which one. Never guess.
-- A return reason must be changed_mind or defective. If the customer does not \
-say which, ask.
-- For a return, call check_return_eligibility before proposing anything. If it \
-returns an error, explain the reason in plain words and propose nothing.
+details in one message with route "clarify". If several orders match, list them.
+- A return reason must be changed_mind or defective.
+- Call check_return_eligibility before proposing a return. If it returns an \
+error, explain it and propose nothing.
 - Writes need two steps. Only call create_return_request or \
-create_support_ticket when the customer clearly asks for the action ("please \
-return it"). If they only ask a question ("can I return it?"), answer it and \
-offer to do the action without calling a write tool. When you do call a write \
-tool the system asks the customer to confirm; never claim the action is already \
-done.
-- A ticket is only for warranty or cancellation. Cancellation is only possible \
-while the order is processing.
-- Off-topic messages (weather, jokes, general chat) get route out_of_scope and \
-one short line about what you can help with.
+create_support_ticket when the customer clearly asks for the action. The system \
+turns the write into a proposal and asks for confirmation; never say it is done.
+- A cancellation is only possible while the order is processing. A warranty \
+ticket requires delivery and at least one covered item.
+- For policy questions call search_policy first and cite only the sections it \
+returns. If no current policy answers, use route "no_answer" and suggest \
+emailing {SUPPORT_EMAIL}. A future-dated document may be mentioned as a future \
+change with its start date.
+- Off-topic messages get route "out_of_scope" and one short line about what you \
+can help with.
 - Write dates like "3 July 2026".
 
 Return your final answer as one JSON object and nothing else:
 {{"answer": "...", "route": "answer|clarify|no_answer|out_of_scope", \
 "citations": [{{"doc_id": "...", "section": "§x.y"}}]}}
-Citations must come only from paragraphs returned by search_policy. Use an empty \
-list when no policy text is used."""
+Citations must come only from sections returned by search_policy in this turn."""
 
 
-# ------------------------------------------------------------------- entry
 def run(
-    settings: Settings,
+    settings,
     ctx: ToolContext,
     session: Session,
     message: str,
     complete_fn=None,
     timeout_s: float = 24.0,
 ) -> ChatResult:
-    """Run the LLM tool loop for one message.
-
-    ``complete_fn`` is injectable so tests never touch the network.
-    """
     complete = complete_fn or complete_chat
-
-    # Assistant.handle() already remembered the current user message.
     history = list(session.messages[:-1])
     neutral: list[dict] = [{"role": "system", "content": system_prompt(settings)}]
     neutral.extend(history)
@@ -232,25 +230,27 @@ def run(
     requested_ids = set(nlu.extract_order_ids(message))
     missing_ids: set[str] = set()
     citations: list[dict] = []
-
     deadline = time.monotonic() + timeout_s
     max_steps = max(2, ctx.max_tool_calls + 2)
+    used_tool = False
 
     for _ in range(max_steps):
         remaining = deadline - time.monotonic()
         if remaining <= 1:
             break
-        try:
-            reply = complete(
-                settings, neutral, TOOL_SPECS, timeout_s=min(20.0, remaining)
-            )
-        except Exception:
-            logger.exception("LLM provider call failed")
-            raise
-
+        reply = complete(
+            settings, neutral, TOOL_SPECS, timeout_s=min(20.0, remaining)
+        )
         calls = reply.tool_calls or []
         if not calls:
-            return _final(reply.text, citations, missing_ids)
+            result = _final(reply.text, citations, missing_ids)
+            logger.info(
+                "LLM reply via %s: route=%s, tool_calls=%d",
+                settings.llm_provider,
+                result.route,
+                len(ctx.calls),
+            )
+            return result
 
         neutral.append(
             {
@@ -262,11 +262,9 @@ def run(
 
         for call in calls:
             name, args, call_id = _call_parts(call)
-
+            used_tool = True
             if name in WRITE_TOOLS:
-                outcome = _handle_write(
-                    ctx, session, message, name, args, citations
-                )
+                outcome = _handle_write(ctx, session, message, name, args, citations)
                 if isinstance(outcome, ChatResult):
                     return outcome
                 neutral.append(_tool_message(call_id, name, outcome))
@@ -282,6 +280,8 @@ def run(
 
     if missing_ids:
         return ChatResult(answer=NOT_FOUND_ANSWER, route="no_answer")
+    if not used_tool:
+        raise RuntimeError("LLM did not use the tools")
     return ChatResult(
         answer=(
             "I've reached the limit for one message. Please ask me again in "
@@ -292,7 +292,6 @@ def run(
     )
 
 
-# ----------------------------------------------------------- tool execution
 def _execute_read(ctx: ToolContext, name: str, args: dict) -> dict:
     try:
         if name == "get_orders":
@@ -323,7 +322,6 @@ def _handle_write(
     args: dict,
     citations: list[dict],
 ) -> ChatResult | dict:
-    """Validate a write and turn it into a proposal. Never writes."""
     if _is_pure_question(message):
         return {
             "pending_confirmation": False,
@@ -355,37 +353,39 @@ def _handle_write(
                 route="answer",
                 citations=list(citations),
             )
+        names = {
+            item["item_id"]: item.get("name") or item["item_id"]
+            for item in order.get("items", [])
+        }
         proposal = Proposal(
             kind="return",
             order_id=order_id,
             item_ids=item_ids,
-            item_names=[
-                item.get("name") or item["item_id"]
-                for item in order.get("items", [])
-                if item["item_id"] in item_ids
-            ],
+            item_names=[names.get(item_id, item_id) for item_id in item_ids],
             reason=reason,
+            summary=f"Return {', '.join(item_ids)} from {order_id} ({reason})",
             citations=list(citations),
             tool_name=name,
             args={"order_id": order_id, "item_ids": item_ids, "reason": reason},
         )
-        answer = _return_proposal_answer(order, item_ids, reason)
+        label = ", ".join(names.get(item_id, item_id) for item_id in item_ids)
+        why = "change of mind" if reason == "changed_mind" else "the item is defective"
+        answer = (
+            f"I can create a return request for {label} from order {order_id} "
+            f"({why}). Shall I go ahead?"
+        )
         return _propose(ctx, session, proposal, answer)
 
-    # create_support_ticket
     order_id = str(args.get("order_id") or "")
     ticket_type = str(args.get("ticket_type") or "")
     summary = str(args.get("summary") or "").strip()
-    if ticket_type not in {"warranty", "cancellation"}:
+    if ticket_type not in rules.VALID_TICKET_TYPES:
         return {
             "error_code": "INVALID_TICKET_TYPE",
             "message": "ticket_type must be warranty or cancellation",
         }
     if not order_id:
-        return {
-            "error_code": "ORDER_NOT_FOUND",
-            "message": "order_id is required",
-        }
+        return {"error_code": "ORDER_NOT_FOUND", "message": "order_id is required"}
     order = ctx.lookup_order(order_id)
     if order is None:
         return ChatResult(answer=NOT_FOUND_ANSWER, route="no_answer")
@@ -396,7 +396,8 @@ def _handle_write(
     else:
         check = rules.evaluate_warranty(order, None, ctx.params)
         covered = ", ".join(
-            entry.get("name") or entry["item_id"] for entry in check.get("covered", [])
+            entry.get("name") or entry["item_id"]
+            for entry in check.get("covered", [])
         )
         default_summary = f"Warranty claim for {covered} from order {order_id}"
 
@@ -414,11 +415,7 @@ def _handle_write(
         summary=summary,
         citations=list(citations),
         tool_name=name,
-        args={
-            "order_id": order_id,
-            "ticket_type": ticket_type,
-            "summary": summary,
-        },
+        args={"order_id": order_id, "ticket_type": ticket_type, "summary": summary},
     )
     if ticket_type == "warranty":
         answer = (
@@ -447,16 +444,11 @@ def _propose(
     )
 
 
-# --------------------------------------------------------------- formatting
-def _final(
-    text: str, seen: list[dict], missing_ids: set[str]
-) -> ChatResult:
+def _final(text: str, seen: list[dict], missing_ids: set[str]) -> ChatResult:
     if missing_ids:
         return ChatResult(answer=NOT_FOUND_ANSWER, route="no_answer")
-
     text = (text or "").strip()
     payload = _extract_json(text)
-
     if payload is None:
         return ChatResult(answer=text or _fallback(), route="answer")
 
@@ -465,11 +457,10 @@ def _final(
     if route not in ROUTES:
         route = "answer"
     if route in {"no_answer", "out_of_scope"}:
-        cites: list[dict] = []
+        citations: list[dict] = []
     else:
-        cites = _valid_citations(payload.get("citations"), seen)
-
-    return ChatResult(answer=answer, route=route, citations=cites)
+        citations = _valid_citations(payload.get("citations"), seen)
+    return ChatResult(answer=answer, route=route, citations=citations)
 
 
 def _extract_json(text: str) -> dict | None:
@@ -502,7 +493,9 @@ def _valid_citations(raw, seen: list[dict]) -> list[dict]:
         if not isinstance(entry, dict):
             continue
         pair = (entry.get("doc_id"), entry.get("section"))
-        if pair in allowed and pair not in {(c["doc_id"], c["section"]) for c in result}:
+        if pair in allowed and pair not in {
+            (c["doc_id"], c["section"]) for c in result
+        }:
             result.append({"doc_id": pair[0], "section": pair[1]})
     return result
 
@@ -519,63 +512,6 @@ def _collect_citations(result: dict, citations: list[dict]) -> None:
             citations.append(entry)
 
 
-def _return_proposal_answer(order: dict, item_ids: list[str], reason: str) -> str:
-    names = {item["item_id"]: item.get("name") or item["item_id"] for item in order.get("items", [])}
-    label = ", ".join(names.get(item_id, item_id) for item_id in item_ids)
-    why = "change of mind" if reason == "changed_mind" else "the item is defective"
-    return (
-        f"I can create a return request for {label} from order "
-        f"{order['order_id']} ({why}). Shall I go ahead?"
-    )
-
-
-def _explain_error(outcome: dict) -> str:
-    code = outcome.get("error_code")
-    return {
-        "ORDER_NOT_FOUND": NOT_FOUND_ANSWER,
-        "RETURN_WINDOW_EXPIRED": (
-            "I can't create the return because the return window has expired. "
-            "Nothing has been saved."
-        ),
-        "OPENED_NOT_RETURNABLE": (
-            "I can't create the return because the item was opened and can only "
-            "be returned while sealed for a change of mind. A defective return is "
-            "still possible. Nothing has been saved."
-        ),
-        "NON_RETURNABLE": (
-            "I can't create the return because this product cannot be returned. "
-            "Nothing has been saved."
-        ),
-        "NOT_DELIVERED": (
-            "I can't create this because the order has not been delivered yet. "
-            "Nothing has been saved."
-        ),
-        "ORDER_ALREADY_SHIPPED": (
-            "I can't create that ticket because the order has already shipped. "
-            "Nothing has been saved."
-        ),
-        "WARRANTY_EXPIRED": (
-            "I can't create that ticket because the warranty has expired. "
-            "Nothing has been saved."
-        ),
-        "NO_WARRANTY": (
-            "I can't create that ticket because these products have no warranty. "
-            "Nothing has been saved."
-        ),
-        "INVALID_ITEM": (
-            "I can't do that because one of the items is not in this order. "
-            "Nothing has been saved."
-        ),
-        "INVALID_REASON": (
-            "I need to know whether this is a change of mind or the item is "
-            "defective. Nothing has been saved."
-        ),
-        "INVALID_TICKET_TYPE": (
-            "I can only open a warranty or cancellation ticket. Nothing has been saved."
-        ),
-    }.get(code, "I can't complete that action. Nothing has been saved.")
-
-
 def _fallback() -> str:
     return (
         "Sorry, I couldn't put that answer together. Please try again, or email "
@@ -584,8 +520,7 @@ def _fallback() -> str:
 
 
 def _is_pure_question(message: str) -> bool:
-    text = nlu.normalize(message)
-    return bool(nlu.QUESTION_RE.search(text)) and not bool(nlu.ACTION_RE.search(text))
+    return nlu.is_question(message) and not nlu.is_action_request(message)
 
 
 def _call_parts(call: dict) -> tuple[str, dict, str]:
@@ -623,7 +558,7 @@ def _tool_message(call_id: str, name: str, result: dict) -> dict:
 
 # --------------------------------------------------------------- providers
 def complete_chat(
-    settings: Settings,
+    settings,
     messages: list[dict],
     tools: list[dict],
     timeout_s: float = 20.0,
@@ -637,9 +572,7 @@ def complete_chat(
     raise ValueError(f"Unsupported LLM provider: {settings.llm_provider!r}")
 
 
-def _openai(
-    settings: Settings, messages: list[dict], tools: list[dict], timeout_s: float
-) -> LLMReply:
+def _openai(settings, messages, tools, timeout_s) -> LLMReply:
     base = settings.llm_base_url or "https://api.openai.com/v1"
     model = settings.llm_model or DEFAULT_MODELS["openai"]
     response = httpx.post(
@@ -698,13 +631,13 @@ def _openai_messages(messages: list[dict]) -> list[dict]:
                 }
             )
         else:
-            converted.append({"role": role, "content": message.get("content") or ""})
+            converted.append(
+                {"role": role, "content": message.get("content") or ""}
+            )
     return converted
 
 
-def _anthropic(
-    settings: Settings, messages: list[dict], tools: list[dict], timeout_s: float
-) -> LLMReply:
+def _anthropic(settings, messages, tools, timeout_s) -> LLMReply:
     model = settings.llm_model or DEFAULT_MODELS["anthropic"]
     system = "\n\n".join(
         message.get("content") or ""
@@ -789,14 +722,14 @@ def _anthropic_messages(messages: list[dict]) -> list[dict]:
                 )
             converted.append({"role": "assistant", "content": blocks or ""})
         else:
-            converted.append({"role": "user", "content": message.get("content") or ""})
+            converted.append(
+                {"role": "user", "content": message.get("content") or ""}
+            )
         index += 1
     return converted
 
 
-def _google(
-    settings: Settings, messages: list[dict], tools: list[dict], timeout_s: float
-) -> LLMReply:
+def _google(settings, messages, tools, timeout_s) -> LLMReply:
     model = settings.llm_model or DEFAULT_MODELS["google"]
     google_tools = [
         {
@@ -816,8 +749,7 @@ def _google(
         if message.get("role") == "system"
     )
     response = httpx.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent",
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         params={"key": settings.llm_api_key},
         json={
             "systemInstruction": {"parts": [{"text": system}]},

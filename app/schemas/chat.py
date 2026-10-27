@@ -1,26 +1,17 @@
-"""Pydantic request and response schemas for the public chat API."""
+"""Pydantic request/response schemas for the chat API."""
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChatRequest(BaseModel):
-    """Body of ``POST /chat``. The customer identity comes from the header."""
-
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     session_id: str = Field(min_length=1, max_length=200)
     message: str = Field(min_length=1, max_length=4000)
-
-    @field_validator("session_id", "message")
-    @classmethod
-    def _not_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("must not be blank")
-        return value.strip()
 
 
 class Citation(BaseModel):
@@ -31,7 +22,7 @@ class Citation(BaseModel):
 class ToolCall(BaseModel):
     name: str
     args: dict = Field(default_factory=dict)
-    status: str
+    status: Literal["success", "error", "pending_confirmation"]
     error_code: str | None = None
 
 
@@ -42,6 +33,7 @@ class ChatResponse(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     tool_calls: list[ToolCall] = Field(default_factory=list)
     pending_confirmation: bool = False
+    session_id: str
 
 
 class ErrorResponse(BaseModel):

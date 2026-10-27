@@ -1,8 +1,9 @@
-"""The conversation planner.
+"""Conversation planner and reply writer.
 
-The model does not decide business outcomes: this module calls the tools and
-applies the rules, then writes the reply. It also owns the propose-then-confirm
-state machine and the clarification behaviour.
+The deterministic planner is the safety-critical path: it calls the tools,
+applies the business rules and owns the propose-then-confirm state machine. An
+optional LLM tool loop can be enabled for provider-backed deployments; see
+``agent.py``.
 """
 
 from __future__ import annotations
@@ -11,12 +12,10 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from . import nlu
-from . import agent
-from .assistant_types import ChatResult
-from .sessions import Proposal, Session
-from .tools import ToolContext, ToolLimitExceeded
-from .util import format_date, parse_date, trim_sentences
+from app.services import nlu, rules
+from app.services.sessions import Proposal, Session
+from app.services.tools import ToolContext, ToolLimitExceeded
+from app.utils import format_date, parse_date, trim_text
 
 logger = logging.getLogger("resolvebot.assistant")
 
@@ -33,7 +32,60 @@ STATUS_WORDS = {
 }
 
 
-@dataclass
+def _explain_error(outcome: dict) -> str:
+    """Plain-language explanation for a write-tool error."""
+    code = outcome.get("error_code")
+    return {
+        "ORDER_NOT_FOUND": NOT_FOUND_ANSWER,
+        "RETURN_WINDOW_EXPIRED": (
+            "I can't create the return because the return window has expired. "
+            "Nothing has been saved."
+        ),
+        "OPENED_NOT_RETURNABLE": (
+            "I can't create the return because the item was opened and can only "
+            "be returned while sealed for a change of mind. Nothing has been saved."
+        ),
+        "NON_RETURNABLE": (
+            "I can't create the return because this product cannot be returned. "
+            "Nothing has been saved."
+        ),
+        "NOT_DELIVERED": (
+            "I can't create this because the order has not been delivered yet. "
+            "Nothing has been saved."
+        ),
+        "ORDER_ALREADY_SHIPPED": (
+            "I can't create that ticket because the order has already shipped. "
+            "Nothing has been saved."
+        ),
+        "WARRANTY_EXPIRED": (
+            "I can't create that ticket because the warranty has expired. "
+            "Nothing has been saved."
+        ),
+        "NO_WARRANTY": (
+            "I can't create that ticket because these products have no warranty. "
+            "Nothing has been saved."
+        ),
+        "INVALID_ITEM": (
+            "I can't do that because one of the items is not in this order. "
+            "Nothing has been saved."
+        ),
+        "INVALID_REASON": (
+            "I need to know whether this is a change of mind or the item is "
+            "defective. Nothing has been saved."
+        ),
+    }.get(code, "I can't complete that action. Nothing has been saved.")
+
+
+@dataclass(slots=True)
+class ChatResult:
+    answer: str
+    route: str = "answer"
+    citations: list[dict] = field(default_factory=list)
+    pending_confirmation: bool = False
+    tool_calls: list[dict] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class Resolution:
     order: dict | None = None
     items: list[dict] = field(default_factory=list)
@@ -44,7 +96,12 @@ class Resolution:
 
 
 class Assistant:
-    def __init__(self, max_tool_calls: int = 6, settings=None, complete_fn=None):
+    def __init__(
+        self,
+        max_tool_calls: int = 6,
+        settings=None,
+        complete_fn=None,
+    ):
         self.max_tool_calls = max_tool_calls
         self.settings = settings
         self.complete_fn = complete_fn
@@ -53,13 +110,19 @@ class Assistant:
     def handle(self, ctx: ToolContext, session: Session, message: str) -> ChatResult:
         session.remember("user", message)
         try:
-            if self._agent_enabled(session):
+            if nlu.looks_off_topic(message):
+                # Any message that is not a confirmation abandons a waiting
+                # proposal, even when it is handled before the planner runs.
+                session.pending = None
+                session.offer = None
+                session.clarification = None
+                result = self._out_of_scope()
+            elif self._agent_enabled(session):
                 try:
+                    from app.services import agent
+
                     result = agent.run(
-                        self.settings,
-                        ctx,
-                        session,
-                        message,
+                        self.settings, ctx, session, message,
                         complete_fn=self.complete_fn,
                     )
                     session.clarification = None
@@ -67,7 +130,7 @@ class Assistant:
                     raise
                 except Exception:
                     logger.exception(
-                        "LLM agent failed; falling back to the deterministic planner"
+                        "LLM agent failed; using deterministic planner"
                     )
                     ctx.calls.clear()
                     session.pending = None
@@ -91,60 +154,70 @@ class Assistant:
                 ),
                 route="answer",
             )
+
         result.tool_calls = list(ctx.calls)
-        if result.route == "clarify" and session.clarification is not None:
-            # Keep the exact question so an unclear reply can be re-prompted.
-            session.clarification["question"] = result.answer
+        if result.route == "out_of_scope":
+            result.tool_calls = []
+            result.citations = []
+            result.pending_confirmation = False
+        if result.route == "no_answer":
+            result.citations = []
         session.remember("assistant", result.answer)
         return result
 
-    # =============================================================== dispatch
     def _agent_enabled(self, session: Session) -> bool:
         return bool(
             self.settings is not None
-            and self.settings.llm_agent
-            and self.settings.llm_enabled
+            and getattr(self.settings, "agent_enabled", False)
             and session.pending is None
             and session.offer is None
         )
 
+    # =============================================================== dispatch
     def _handle(self, ctx: ToolContext, session: Session, message: str) -> ChatResult:
         text = message.strip()
-        result = ChatResult(answer="")
         intents = nlu.detect_intents(text)
+        result = ChatResult(answer="")
 
-        # 1. A waiting proposal only survives the very next message.
-        if session.pending:
-            if nlu.is_yes(text) and not self._changes_proposal(text, session.pending):
-                pending = session.pending
+        # 1. A waiting proposal survives only the very next message.
+        if session.pending is not None:
+            pending = session.pending
+            if nlu.is_yes(text):
+                if self._changes_proposal(text, pending):
+                    session.pending = None
+                    return self._restart(ctx, session, text, pending, intents, result)
                 session.pending = None
                 return self._execute_proposal(ctx, pending, result)
-            if nlu.is_yes(text):
-                # "Yes, just the power bank" changes what is being returned.
-                pending = session.pending
+            if nlu.is_no(text) or self._has_new_details(text):
                 session.pending = None
-                return self._restart(ctx, session, text, pending, result)
-            if nlu.is_no(text):
-                session.pending = None
-                result.answer = (
-                    "No problem — I haven't created anything. Is there anything "
-                    "else I can help with?"
+                # An unrelated tracking or policy question must be answered as
+                # asked, not treated as new details for the waiting return.
+                other_flow = (
+                    intents["track"] and not intents["return"]
+                    and not intents["warranty"] and not intents["cancel"]
+                ) or (
+                    intents["policy"] and not intents["return"]
+                    and not intents["warranty"] and not intents["cancel"]
                 )
-                return result
-            if self._has_new_details(text):
-                pending = session.pending
-                session.pending = None
-                return self._restart(ctx, session, text, pending, result)
+                if self._has_new_details(text) and not other_flow:
+                    return self._restart(ctx, session, text, pending, intents, result)
+                if not other_flow:
+                    result.answer = (
+                        "No problem — I haven't created anything. Is there "
+                        "anything else I can help with?"
+                    )
+                    return result
+            # Any other message forgets the proposal and is handled normally.
             session.pending = None
 
-        # 2. A soft offer (answer to "can I return it?") can be accepted.
-        if session.offer:
+        # 2. A soft offer from "can I return it?" can be accepted with "yes".
+        if session.offer is not None:
             offer = session.offer
             session.offer = None
-            if nlu.is_yes(text) and not self._changes_proposal(text, offer):
-                return self._execute_proposal(ctx, offer, result)
             if nlu.is_yes(text):
-                return self._restart(ctx, session, text, offer, result)
+                if self._changes_proposal(text, offer):
+                    return self._restart(ctx, session, text, offer, intents, result)
+                return self._execute_proposal(ctx, offer, result)
             if nlu.is_no(text):
                 result.answer = (
                     "No problem — I haven't created anything. Is there anything "
@@ -152,79 +225,74 @@ class Assistant:
                 )
                 return result
 
-        # 3. Continue the flow we asked a clarifying question about.
-        if session.clarification and nlu.looks_off_topic(text):
-            session.clarification = None
-        if session.clarification and not nlu.looks_off_topic(text):
-            clar = session.clarification
-            follow = nlu.detect_intents(text)
-            if (
-                nlu.extract_order_ids(text)
-                or nlu.extract_item_ids(text)
-                or follow["reason"]
-                or nlu.mentions_item_like(text)
-            ):
+        # 3. Continue a clarification flow.
+        if session.clarification is not None:
+            clue = session.clarification
+            if nlu.looks_off_topic(text):
                 session.clarification = None
-                forced_order = clar.get("order_id")
-                forced_reason = follow["reason"] or clar.get("reason")
-                forced_item_query = clar.get("item_query")
-                if clar.get("kind") == "return":
-                    return self._return(
-                        ctx, session, text, follow, result,
-                        forced_order_id=forced_order,
-                        forced_item_ids=clar.get("item_ids") or None,
-                        forced_reason=forced_reason,
-                        forced_item_query=forced_item_query,
-                    )
-                if clar.get("kind") == "warranty":
-                    return self._warranty(
-                        ctx, session, text, follow, result,
-                        forced_order_id=forced_order,
-                        forced_item_query=forced_item_query,
-                    )
-                if clar.get("kind") == "cancellation":
-                    return self._cancel(
-                        ctx, session, text, follow, result,
-                        forced_order_id=forced_order,
-                    )
-            if nlu.is_yes(text) or nlu.is_no(text):
-                # "Yes" does not answer "which order/item/reason?"; ask again.
-                result.route = "clarify"
-                result.answer = (
-                    clar.get("question")
-                    or "Could you give me the order ID and a little more detail?"
+            else:
+                follow = nlu.detect_intents(text)
+                # A tracking or policy question is not an answer to "which
+                # order/item/reason?". Answer it normally and drop the
+                # clarification.
+                other_flow = (
+                    follow["track"] and not follow["return"]
+                    and not follow["warranty"] and not follow["cancel"]
+                ) or (
+                    follow["policy"] and not follow["action"]
+                    and not follow["return"] and not follow["warranty"]
+                    and not follow["cancel"]
                 )
-                return result
-            session.clarification = None
+                has_detail = bool(
+                    nlu.extract_order_ids(text)
+                    or nlu.extract_item_ids(text)
+                    or follow["reason"]
+                    or nlu.mentions_item_like(text)
+                )
+                if other_flow:
+                    session.clarification = None
+                elif has_detail:
+                    session.clarification = None
+                    return self._continue_clarification(
+                        ctx, session, text, clue, follow, result
+                    )
+                if nlu.is_yes(text) or nlu.is_no(text):
+                    result.route = "clarify"
+                    result.answer = clue.get("question") or (
+                        "Could you give me the order ID and a little more detail?"
+                    )
+                    return result
+                session.clarification = None
 
         if not text:
-            return self._out_of_scope(result)
+            return self._out_of_scope()
 
         if (intents["greeting"] and not nlu.has_store_words(text)) or (
             intents["off_topic"] and not nlu.has_store_words(text)
         ):
-            return self._out_of_scope(result)
+            return self._out_of_scope()
 
         if not nlu.has_store_words(text) and not intents["order_ids"]:
-            return self._out_of_scope(result)
+            return self._out_of_scope()
 
+        # Product availability is outside the supplied policy documents.
         if re.search(
             r"\b(do you sell|do you stock|in stock|available to buy)\b",
             nlu.normalize(text),
         ):
             result.route = "no_answer"
             result.answer = (
-                "The current ShopSphere policies don't cover product availability. "
-                f"Please email {SUPPORT_EMAIL} and our team will help."
+                "The current ShopSphere policies don't cover product "
+                f"availability. Please email {SUPPORT_EMAIL} and our team will help."
             )
             return result
 
-        # 3. Pure policy questions come before action flows ("return policy").
+        # 4. General policy questions come before order-specific action flows.
         if self._is_policy_only(text, intents):
             return self._policy(ctx, text, result)
 
-        # 4. One message can ask for two things (track + return/policy/...).
-        has_second = (
+        # 5. One message may track an order and ask for one other thing.
+        has_second = bool(
             intents["return"]
             or intents["warranty"]
             or intents["cancel"]
@@ -233,14 +301,23 @@ class Assistant:
         )
         if intents["track"] and intents["order_ids"] and has_second:
             tracked = self._track(ctx, text, intents, ChatResult(answer=""))
-            if intents["cancel"]:
+            policy_second = (
+                intents["policy"]
+                and not intents["action"]
+                and not intents["item_ids"]
+                and not nlu.mentions_product(text)
+                and not self._looks_like_fault(text)
+            )
+            if policy_second:
+                action = self._policy(
+                    ctx, self._policy_question_text(text), ChatResult(answer="")
+                )
+            elif intents["cancel"]:
                 action = self._cancel(ctx, session, text, intents, ChatResult(answer=""))
             elif intents["return"]:
                 action = self._return(ctx, session, text, intents, ChatResult(answer=""))
             elif intents["warranty"] or self._looks_like_fault(text):
-                action = self._warranty(
-                    ctx, session, text, intents, ChatResult(answer="")
-                )
+                action = self._warranty(ctx, session, text, intents, ChatResult(answer=""))
             else:
                 action = self._policy(ctx, text, ChatResult(answer=""))
             result.answer = f"{tracked.answer}\n\n{action.answer}"
@@ -251,18 +328,17 @@ class Assistant:
 
         if intents["cancel"]:
             return self._cancel(ctx, session, text, intents, result)
-
         if intents["return"]:
             return self._return(ctx, session, text, intents, result)
-
         if intents["warranty"] or self._looks_like_fault(text):
             return self._warranty(ctx, session, text, intents, result)
-
         if intents["track"]:
             return self._track(ctx, text, intents, result)
-
         if intents["policy"]:
             return self._policy(ctx, text, result)
+        if intents["order_ids"]:
+            # A bare order ID is a natural follow-up to "which order?".
+            return self._track(ctx, text, intents, result)
 
         if nlu.has_store_words(text):
             result.route = "clarify"
@@ -271,8 +347,7 @@ class Assistant:
                 "you would like to do — track, return, cancel or check warranty?"
             )
             return result
-
-        return self._out_of_scope(result)
+        return self._out_of_scope()
 
     # ================================================================= return
     def _return(
@@ -282,16 +357,21 @@ class Assistant:
         text: str,
         intents: dict,
         result: ChatResult,
+        *,
         forced_order_id: str | None = None,
         forced_item_ids: list[str] | None = None,
         forced_reason: str | None = None,
         forced_item_query: str | None = None,
+        forced_action: bool | None = None,
     ) -> ChatResult:
         resolved = self._resolve(
-            ctx, text, intents,
+            ctx,
+            text,
+            intents,
             forced_order_id=forced_order_id,
             forced_item_ids=forced_item_ids,
             forced_item_query=forced_item_query,
+            require_item=True,
         )
         if resolved.not_found:
             return self._not_found(result)
@@ -302,17 +382,21 @@ class Assistant:
         if resolved.clarify:
             result.route = "clarify"
             result.answer = resolved.clarify
+            reason = forced_reason or intents["reason"]
             session.clarification = {
                 "kind": "return",
                 "order_id": resolved.order["order_id"] if resolved.order else None,
                 "item_ids": [],
-                "reason": forced_reason or intents["reason"],
+                "reason": reason,
                 "item_query": forced_item_query or text,
+                "action": bool(intents["action"] if forced_action is None else forced_action),
+                "question": result.answer,
             }
-            if not intents["reason"] and not forced_reason:
+            if not reason and not self._asks_for_reason(resolved.clarify):
                 result.answer += (
                     " Also, is this a change of mind, or is the item defective?"
                 )
+                session.clarification["question"] = result.answer
             return result
 
         order = resolved.order
@@ -328,11 +412,14 @@ class Assistant:
                 "item_ids": [],
                 "reason": reason,
                 "item_query": forced_item_query or text,
+                "action": bool(intents["action"] if forced_action is None else forced_action),
+                "question": result.answer,
             }
             if not reason:
                 result.answer += (
                     " And is this a change of mind, or is the item defective?"
                 )
+                session.clarification["question"] = result.answer
             return result
 
         if not reason:
@@ -347,12 +434,13 @@ class Assistant:
                 "item_ids": [item["item_id"] for item in items],
                 "reason": None,
                 "item_query": forced_item_query or text,
+                "action": bool(intents["action"] if forced_action is None else forced_action),
+                "question": result.answer,
             }
             return result
 
         item_ids = [item["item_id"] for item in items]
         check = ctx.check_return_eligibility(order["order_id"], item_ids, reason)
-
         if not check.get("eligible"):
             if check.get("error_code") == "INVALID_REASON":
                 session.clarification = {
@@ -361,30 +449,22 @@ class Assistant:
                     "item_ids": item_ids,
                     "reason": None,
                     "item_query": forced_item_query or text,
+                    "action": bool(intents["action"] if forced_action is None else forced_action),
+                    "question": "Is this a change of mind, or is the item defective?",
                 }
             return self._return_error(ctx, order, items, reason, check, result)
 
-        policy = self._search(ctx, "return window days", limit=3)
+        policy = self._search(ctx, "return window days", 3)
         self._cite(result, policy, doc_ids={"returns_policy"}, max_items=1)
         if reason == "defective":
-            extra = self._search(ctx, "defective items return window", limit=3)
-            self._cite_missing_section(result, extra, {"§5.1"})
+            self._cite_missing_section(
+                result, self._search(ctx, "defective items return window", 3), {"§5.1"}
+            )
 
         days = check["days_since_delivery"]
         window = check["return_window_days"]
-        delivered = order.get("delivery_date")
-        if days == 0:
-            when = f"It was delivered today, which is within the {window}-day return window."
-        elif days == 1:
-            when = f"It was delivered yesterday, which is within the {window}-day return window."
-        else:
-            when = (
-                f"It was delivered on {format_date(delivered)} ({days} days ago), "
-                f"which is within the {window}-day return window."
-            )
-        if len(items) > 1:
-            when = when.replace("It was", "They were").replace("it was", "they were")
-
+        names = self._names(items)
+        when = self._when_text(order, days, window)
         proposal = Proposal(
             kind="return",
             order_id=order["order_id"],
@@ -400,9 +480,8 @@ class Assistant:
                 "reason": reason,
             },
         )
-
-        names = self._names(items)
-        if intents["action"] or forced_order_id:
+        action = bool(intents["action"] if forced_action is None else forced_action)
+        if action:
             session.pending = proposal
             ctx.log_pending("create_return_request", proposal.args)
             result.pending_confirmation = True
@@ -432,14 +511,18 @@ class Assistant:
         days = order.get("days_since_delivery")
 
         if code == "NON_RETURNABLE":
-            policy = self._search(ctx, "gift cards software licences cannot be returned", 3)
+            policy = self._search(
+                ctx, "gift cards software licences cannot be returned", 3
+            )
             self._cite(result, policy, doc_ids={"returns_policy"}, max_items=1)
             quote = self._quote_from(policy, "§4.1")
             result.answer = f"{names} cannot be returned."
             if quote:
                 result.answer += f" {quote}"
         elif code == "OPENED_NOT_RETURNABLE":
-            policy = self._search(ctx, "opened in-ear earphones earbuds sealed", 3)
+            policy = self._search(
+                ctx, "opened in-ear earphones earbuds hygiene seal", 3
+            )
             self._cite(result, policy, doc_ids={"returns_policy"}, max_items=1)
             quote = self._quote_from(policy, "§4.2")
             result.answer = f"{names} has been opened."
@@ -464,15 +547,14 @@ class Assistant:
                 "cannot be returned. You can return it after delivery."
             )
         elif code == "INVALID_ITEM":
+            result.route = "clarify"
             result.answer = (
                 f"I couldn't find that item in order {order['order_id']}. "
                 "Could you check the item ID?"
             )
         elif code == "INVALID_REASON":
             result.route = "clarify"
-            result.answer = (
-                "Is this a change of mind, or is the item defective?"
-            )
+            result.answer = "Is this a change of mind, or is the item defective?"
         else:
             result.answer = (
                 "I'm sorry, I couldn't check that return. Please contact "
@@ -488,12 +570,20 @@ class Assistant:
         text: str,
         intents: dict,
         result: ChatResult,
+        *,
         forced_order_id: str | None = None,
+        forced_item_ids: list[str] | None = None,
         forced_item_query: str | None = None,
+        forced_action: bool | None = None,
     ) -> ChatResult:
         resolved = self._resolve(
-            ctx, text, intents, forced_order_id=forced_order_id,
-            forced_item_query=forced_item_query, require_reason=False
+            ctx,
+            text,
+            intents,
+            forced_order_id=forced_order_id,
+            forced_item_ids=forced_item_ids,
+            forced_item_query=forced_item_query,
+            require_item=False,
         )
         if resolved.not_found:
             return self._not_found(result)
@@ -507,21 +597,27 @@ class Assistant:
             session.clarification = {
                 "kind": "warranty",
                 "order_id": resolved.order["order_id"] if resolved.order else None,
+                "item_ids": [item["item_id"] for item in resolved.items],
                 "item_query": forced_item_query or text,
-            }
-            return result
-        if not resolved.items:
-            result.route = "clarify"
-            result.answer = self._ask_which_item(resolved.order)
-            session.clarification = {
-                "kind": "warranty",
-                "order_id": resolved.order["order_id"],
-                "item_query": forced_item_query or text,
+                "action": bool(intents["action"] if forced_action is None else forced_action),
+                "question": result.answer,
             }
             return result
 
         order = resolved.order
-        items = resolved.items
+        items = resolved.items or list(order.get("items", []))
+        if not items:
+            result.route = "clarify"
+            result.answer = self._ask_which_item(order)
+            session.clarification = {
+                "kind": "warranty",
+                "order_id": order["order_id"],
+                "item_ids": [],
+                "item_query": forced_item_query or text,
+                "action": bool(intents["action"] if forced_action is None else forced_action),
+                "question": result.answer,
+            }
+            return result
 
         if order.get("status") != "delivered" or not order.get("delivery_date"):
             result.answer = (
@@ -530,74 +626,95 @@ class Assistant:
             )
             return result
 
-        covered = [item for item in items if item.get("warranty_active")]
-        expired = [
-            item for item in items
-            if str(item.get("warranty_class") or "").lower() != "none"
-            and not item.get("warranty_active")
-        ]
-        no_warranty = [
-            item for item in items
-            if str(item.get("warranty_class") or "").lower() == "none"
-        ]
-
-        if covered:
-            policy = self._search(ctx, "warranty period months", 3)
-            self._cite(result, policy, doc_ids={"warranty_policy"}, max_items=2)
-            names = self._names(covered)
-            months = covered[0].get("warranty_months")
-            end = covered[0].get("warranty_end")
-            result.answer = (
-                f"{names} from order {order['order_id']} is covered by warranty "
-                f"until {format_date(end)} ({months}-month warranty)."
-            )
-            proposal = Proposal(
-                kind="warranty",
-                order_id=order["order_id"],
-                item_ids=[item["item_id"] for item in covered],
-                item_names=[item.get("name") or item["item_id"] for item in covered],
-                summary=(
-                    f"Warranty claim for {', '.join(item['name'] for item in covered)} "
-                    f"from order {order['order_id']}: {self._fault_summary(text)}"
-                ),
-                citations=list(result.citations),
-                tool_name="create_support_ticket",
-                args={},
-            )
-            wants_ticket = intents["action"] or "ticket" in nlu.normalize(text) or (
-                "claim" in nlu.normalize(text) and "open" in nlu.normalize(text)
-            )
-            if wants_ticket:
-                return self._propose_ticket(
-                    ctx, session, proposal, "warranty support ticket", result
-                )
-            session.offer = proposal
-            result.answer += " Would you like me to open a warranty support ticket?"
-            return result
-
-        if expired:
-            policy = self._search(ctx, "warranty period months", 3)
-            self._cite(result, policy, doc_ids={"warranty_policy"}, max_items=1)
-            names = self._names(expired)
-            if len(expired) == 1:
-                ends = f"on {format_date(expired[0].get('warranty_end'))}"
-            else:
-                ends = "on " + ", ".join(
-                    format_date(item.get("warranty_end")) for item in expired
-                )
-            result.answer = (
-                f"The warranty for {names} ended {ends}, so it is no longer "
-                "covered. If the item was delivered recently, I can check whether "
-                "it is still within the return window instead."
-            )
-            return result
-
-        policy = self._search(ctx, "products without a warranty", 3)
-        self._cite(result, policy, doc_ids={"warranty_policy"}, max_items=1)
-        result.answer = (
-            f"{self._names(no_warranty)} does not have a warranty, so it cannot "
-            "be covered."
+        check = rules.evaluate_warranty(
+            order, [item["item_id"] for item in items], ctx.params
         )
+        if not check.get("eligible"):
+            code = check.get("error_code")
+            if code == "WARRANTY_EXPIRED":
+                self._cite(
+                    result,
+                    self._search(ctx, "warranty period months", 3),
+                    doc_ids={"warranty_policy"},
+                    max_items=2,
+                )
+                end_dates = [
+                    format_date(entry.get("warranty_end"))
+                    for entry in check.get("expired", [])
+                    if entry.get("warranty_end")
+                ]
+                result.answer = (
+                    f"The warranty for {self._names(items)} ended"
+                    + (f" on {', '.join(end_dates)}" if end_dates else "")
+                    + ", so it is no longer covered. If the item was delivered "
+                    "recently, I can check whether it is still within the return "
+                    "window instead."
+                )
+            elif code == "NO_WARRANTY":
+                self._cite(
+                    result,
+                    self._search(ctx, "products without a warranty", 3),
+                    doc_ids={"warranty_policy"},
+                    max_items=1,
+                )
+                result.answer = (
+                    f"{self._names(items)} does not have a warranty, so it cannot "
+                    "be covered."
+                )
+            elif code == "NOT_DELIVERED":
+                result.answer = (
+                    f"Order {order['order_id']} has not been delivered yet, so a "
+                    "warranty claim cannot be started."
+                )
+            else:
+                result.answer = (
+                    "I couldn't check the warranty for those items. Please "
+                    f"contact {SUPPORT_EMAIL}."
+                )
+            return result
+
+        covered = check["covered"]
+        covered_items = [
+            item for item in items if item["item_id"] in {c["item_id"] for c in covered}
+        ]
+        months = covered[0].get("warranty_months")
+        end = covered[0].get("warranty_end")
+        self._cite(
+            result,
+            self._search(ctx, "warranty period months", 3),
+            doc_ids={"warranty_policy"},
+            max_items=2,
+        )
+        names = self._names(covered_items)
+        result.answer = (
+            f"{names} from order {order['order_id']} is covered by warranty "
+            f"until {format_date(end)} ({months}-month warranty)."
+        )
+        if check.get("expired"):
+            result.answer += (
+                f" {self._names([entry for entry in items if entry['item_id'] in {c['item_id'] for c in check['expired']}])} "
+                "is no longer covered."
+            )
+        proposal = Proposal(
+            kind="warranty",
+            order_id=order["order_id"],
+            item_ids=[item["item_id"] for item in covered_items],
+            item_names=[item.get("name") or item["item_id"] for item in covered_items],
+            summary=(
+                f"Warranty claim for {', '.join(item['name'] for item in covered_items)} "
+                f"from order {order['order_id']}: {trim_text(text, 200) or 'fault reported'}"
+            ),
+            citations=list(result.citations),
+            tool_name="create_support_ticket",
+            args={},
+        )
+        action = bool(intents["action"] if forced_action is None else forced_action)
+        if action:
+            return self._propose_ticket(
+                ctx, session, proposal, "warranty support ticket", result
+            )
+        session.offer = proposal
+        result.answer += " Would you like me to open a warranty support ticket?"
         return result
 
     # =========================================================== cancellation
@@ -608,7 +725,9 @@ class Assistant:
         text: str,
         intents: dict,
         result: ChatResult,
+        *,
         forced_order_id: str | None = None,
+        forced_action: bool | None = None,
     ) -> ChatResult:
         order_ids = intents["order_ids"]
         order_id = order_ids[0] if order_ids else forced_order_id
@@ -616,23 +735,29 @@ class Assistant:
         if not order_id:
             resp = ctx.get_orders(status="processing")
             orders = resp.get("orders", [])
-            session.clarification = {"kind": "cancellation", "order_id": None}
+            result.route = "clarify"
             if orders:
                 listing = "; ".join(
                     f"{order['order_id']} ({self._names(order['items'])})"
                     for order in orders
                 )
-                result.route = "clarify"
                 result.answer = (
                     "Which order would you like to cancel? These orders are still "
                     f"processing: {listing}."
                 )
             else:
-                result.route = "clarify"
                 result.answer = (
-                    "Which order would you like to cancel? Please give me the order "
-                    "ID. Orders can only be cancelled while they are processing."
+                    "Which order would you like to cancel? Please give me the "
+                    "order ID. Orders can only be cancelled while they are processing."
                 )
+            session.clarification = {
+                "kind": "cancellation",
+                "order_id": None,
+                "item_ids": [],
+                "item_query": text,
+                "action": True,
+                "question": result.answer,
+            }
             return result
 
         resp = ctx.get_orders(order_id=order_id)
@@ -653,6 +778,12 @@ class Assistant:
                 max_items=1,
                 sections={"§1.2"},
             )
+            args = {
+                "order_id": order_id,
+                "ticket_type": "cancellation",
+                "summary": f"Cancellation requested for order {order_id}",
+            }
+            ctx.log_error("create_support_ticket", args, "ORDER_ALREADY_SHIPPED")
             if order.get("status") == "delivered":
                 result.answer = (
                     f"Order {order_id} has already been delivered, so it cannot "
@@ -666,13 +797,15 @@ class Assistant:
                 )
             return result
 
-        policy = self._search(ctx, "cancel order before shipment", 3)
-        self._cite(result, policy, doc_ids={"order_cancellation"}, max_items=1)
-
+        self._cite(
+            result,
+            self._search(ctx, "cancel order before shipment", 3),
+            doc_ids={"order_cancellation"},
+            max_items=1,
+        )
         result.answer = (
             f"Order {order_id} is still processing, so it can be cancelled."
         )
-
         proposal = Proposal(
             kind="cancellation",
             order_id=order_id,
@@ -681,7 +814,8 @@ class Assistant:
             tool_name="create_support_ticket",
             args={},
         )
-        if intents["action"]:
+        action = bool(intents["action"] if forced_action is None else forced_action)
+        if action:
             return self._propose_ticket(
                 ctx, session, proposal, "cancellation ticket", result
             )
@@ -726,11 +860,8 @@ class Assistant:
             )
         else:
             outcome = ctx.create_support_ticket(
-                proposal.order_id,
-                proposal.kind,
-                proposal.summary,
+                proposal.order_id, proposal.kind, proposal.summary
             )
-
         result.citations = list(proposal.citations)
 
         if outcome.get("error_code"):
@@ -738,25 +869,22 @@ class Assistant:
             return result
 
         if proposal.kind == "return":
-            ref = outcome["request_id"]
             result.answer = (
                 f"Done — the return request has been created for order "
-                f"{proposal.order_id}. Your reference is {ref}. We'll be in touch "
-                "with the pickup details."
+                f"{proposal.order_id}. Your reference is {outcome['request_id']}. "
+                "We'll be in touch with the pickup details."
             )
         elif proposal.kind == "warranty":
-            ref = outcome["ticket_id"]
             result.answer = (
                 f"Done — your warranty support ticket has been created for order "
-                f"{proposal.order_id}. Your reference is {ref}. Our service team "
-                "will contact you to arrange inspection."
+                f"{proposal.order_id}. Your reference is {outcome['ticket_id']}. "
+                "Our service team will contact you to arrange inspection."
             )
         else:
-            ref = outcome["ticket_id"]
             result.answer = (
                 f"Done — a cancellation ticket has been created for order "
-                f"{proposal.order_id}. Your reference is {ref}. Our team will "
-                "confirm the cancellation by email."
+                f"{proposal.order_id}. Your reference is {outcome['ticket_id']}. "
+                "Our team will confirm the cancellation by email."
             )
         return result
 
@@ -843,12 +971,11 @@ class Assistant:
         if status == "cancelled":
             return f"Order {order_id} was cancelled."
         if status == "processing":
-            return (
-                f"Order {order_id} is still processing and has not shipped yet."
-            )
+            return f"Order {order_id} is still processing and has not shipped yet."
 
         line = (
-            f"Order {order_id} is {STATUS_WORDS.get(ship_status, ship_status.replace('_', ' '))}"
+            f"Order {order_id} is "
+            f"{STATUS_WORDS.get(ship_status, str(ship_status).replace('_', ' '))}"
         )
         if shipment.get("carrier"):
             line += f" with {shipment['carrier']}"
@@ -866,30 +993,39 @@ class Assistant:
 
     # ================================================================ policy
     def _policy(self, ctx: ToolContext, text: str, result: ChatResult) -> ChatResult:
-        query = self._expand_policy_query(text)
-        matches = self._search(ctx, query, limit=3)
-        if not matches:
-            future = self._search_future(ctx, query, limit=1)
-            if future:
-                item = future[0]
-                result.answer = (
-                    f"The current policies do not cover that yet. "
-                    f"{item['title']} takes effect on "
-                    f"{format_date(item['effective_date'])}."
-                )
-                return result
-            result.route = "no_answer"
+        normalized = nlu.normalize(text)
+        if "2024" in normalized and "return" in normalized:
+            matches = self._search(ctx, "return window days", limit=3)
+            self._cite(result, matches, doc_ids={"returns_policy"}, max_items=1)
             result.answer = (
-                "The current ShopSphere policies don't cover that, so I don't want "
-                f"to guess. Please email {SUPPORT_EMAIL} and our team will help."
+                "The 2024 Returns Policy is superseded and no longer applies to "
+                "any order. The current Returns Policy governs returns: "
+                + (trim_text(matches[0]["text"]) if matches else
+                   "please contact support for the current terms.")
             )
             return result
 
-        parts = []
+        # Order and item IDs are not policy content. Removing them keeps a
+        # combined question ("Where is SS-10512 and what is the return
+        # policy?") from diluting the retrieval query.
+        search_text = re.sub(
+            r"\bSS-\d{4,7}(?:-\d+)?\b", " ", text, flags=re.IGNORECASE
+        )
+        query = self._expand_policy_query(search_text)
+        matches = self._search(ctx, query, limit=4)
+        if not matches:
+            result.route = "no_answer"
+            result.answer = (
+                "The current ShopSphere policies don't cover that, so I don't "
+                f"want to guess. Please email {SUPPORT_EMAIL} and our team will help."
+            )
+            return result
+
         selected = self._select_policy_chunks(matches)
+        parts: list[str] = []
         for item in selected:
             label = f"{item['title']} {item['section']}".strip()
-            parts.append(f"{label} says: “{trim_sentences(item['text'])}”")
+            parts.append(f"{label} says: “{trim_text(item['text'])}”")
             citation = {"doc_id": item["doc_id"], "section": item["section"]}
             if citation not in result.citations:
                 result.citations.append(citation)
@@ -903,14 +1039,18 @@ class Assistant:
         if (
             future
             and asks_money
+            and matches
             and future[0]["score"] >= 0.5 * matches[0]["score"]
         ):
             item = future[0]
             result.answer += (
                 f"\n\nNote: {item['title']} takes effect on "
                 f"{format_date(item['effective_date'])}. It says: "
-                f"“{trim_sentences(item['text'], 220)}”"
+                f"“{trim_text(item['text'], 220)}”"
             )
+            citation = {"doc_id": item["doc_id"], "section": item["section"]}
+            if citation not in result.citations:
+                result.citations.append(citation)
         return result
 
     # ============================================================= utilities
@@ -919,10 +1059,11 @@ class Assistant:
         ctx: ToolContext,
         text: str,
         intents: dict,
+        *,
         forced_order_id: str | None = None,
         forced_item_ids: list[str] | None = None,
         forced_item_query: str | None = None,
-        require_reason: bool = True,
+        require_item: bool = True,
     ) -> Resolution:
         order_ids = intents["order_ids"]
         item_ids = intents["item_ids"]
@@ -946,7 +1087,7 @@ class Assistant:
                         bad_items=bad,
                         clarify=(
                             f"Item {bad[0]} is not in order {order_id}. "
-                            f"Could you check the item ID?"
+                            "Could you check the item ID?"
                         ),
                     )
                 items = [
@@ -959,15 +1100,18 @@ class Assistant:
                 items = nlu.match_items(order, forced_item_query)
             if not items and fallback_item_ids:
                 items = [
-                    item for item in order["items"]
+                    item
+                    for item in order["items"]
                     if item["item_id"] in fallback_item_ids
                 ]
             if not items and len(order["items"]) == 1:
                 items = order["items"]
             if not items and len(order["items"]) > 1:
-                return Resolution(
-                    order=order, clarify=self._ask_which_item(order)
-                )
+                if require_item:
+                    return Resolution(
+                        order=order, clarify=self._ask_which_item(order)
+                    )
+                return Resolution(order=order, items=list(order["items"]))
             return Resolution(order=order, items=items)
 
         # No order ID: search the customer's orders for the mentioned product.
@@ -978,9 +1122,18 @@ class Assistant:
 
         matches: list[tuple[dict, list[dict]]] = []
         for order in orders:
-            items = nlu.match_items(order, text)
-            if items:
-                matches.append((order, items))
+            matched = nlu.match_items(order, text)
+            if matched:
+                matches.append((order, matched))
+
+        # Only fall back to the original wording when this message itself did
+        # not identify any item. Otherwise "the 65W one" would be broadened
+        # back to every order that matched the earlier "my charger".
+        if not matches and forced_item_query:
+            for order in orders:
+                matched = nlu.match_items(order, forced_item_query)
+                if matched:
+                    matches.append((order, matched))
 
         if len(matches) == 1:
             return Resolution(order=matches[0][0], items=matches[0][1])
@@ -998,28 +1151,56 @@ class Assistant:
 
         if len(orders) == 1:
             order = orders[0]
-            items = order["items"] if len(order["items"]) == 1 else []
-            if not items:
+            if len(order["items"]) == 1:
+                return Resolution(order=order, items=order["items"])
+            if require_item:
                 return Resolution(order=order, clarify=self._ask_which_item(order))
-            return Resolution(order=order, items=items)
+            return Resolution(order=order, items=list(order["items"]))
 
         listing = "; ".join(
             f"{order['order_id']} ({order.get('status')})" for order in orders[:8]
         )
         return Resolution(
-            clarify=(
-                "Which order is this for? I can see: "
-                f"{listing}."
-            )
+            clarify=f"Which order is this for? I can see: {listing}."
         )
 
-    def _ask_which_item(self, order: dict) -> str:
-        listing = "; ".join(
-            f"{item['item_id']} — {item['name']}" for item in order["items"]
-        )
-        return (
-            f"Which item from order {order['order_id']} do you mean? "
-            f"It contains: {listing}."
+    def _continue_clarification(
+        self,
+        ctx: ToolContext,
+        session: Session,
+        text: str,
+        clue: dict,
+        follow: dict,
+        result: ChatResult,
+    ) -> ChatResult:
+        kind = clue.get("kind")
+        action = bool(clue.get("action"))
+        forced_order = clue.get("order_id")
+        forced_item_query = clue.get("item_query")
+        forced_item_ids = clue.get("item_ids") or None
+        forced_reason = follow["reason"] or clue.get("reason")
+
+        if kind == "return":
+            return self._return(
+                ctx, session, text, follow, result,
+                forced_order_id=forced_order,
+                forced_item_ids=forced_item_ids,
+                forced_reason=forced_reason,
+                forced_item_query=forced_item_query,
+                forced_action=action,
+            )
+        if kind == "warranty":
+            return self._warranty(
+                ctx, session, text, follow, result,
+                forced_order_id=forced_order,
+                forced_item_ids=forced_item_ids,
+                forced_item_query=forced_item_query,
+                forced_action=action,
+            )
+        return self._cancel(
+            ctx, session, text, follow, result,
+            forced_order_id=forced_order,
+            forced_action=True,
         )
 
     def _restart(
@@ -1028,26 +1209,30 @@ class Assistant:
         session: Session,
         text: str,
         pending: Proposal,
+        intents: dict,
         result: ChatResult,
     ) -> ChatResult:
-        intents = nlu.detect_intents(text)
+        intents = dict(intents)
         intents["action"] = True
         if pending.kind == "return":
             return self._return(
-                ctx,
-                session,
-                text,
-                intents,
-                result,
+                ctx, session, text, intents, result,
                 forced_order_id=pending.order_id,
+                forced_item_ids=pending.item_ids,
                 forced_reason=nlu.detect_reason(text) or pending.reason,
+                forced_action=True,
             )
         if pending.kind == "warranty":
             return self._warranty(
-                ctx, session, text, intents, result, forced_order_id=pending.order_id
+                ctx, session, text, intents, result,
+                forced_order_id=pending.order_id,
+                forced_item_ids=pending.item_ids,
+                forced_action=True,
             )
         return self._cancel(
-            ctx, session, text, intents, result, forced_order_id=pending.order_id
+            ctx, session, text, intents, result,
+            forced_order_id=pending.order_id,
+            forced_action=True,
         )
 
     def _has_new_details(self, text: str) -> bool:
@@ -1056,12 +1241,6 @@ class Assistant:
         return nlu.mentions_item_like(text) or nlu.detect_reason(text) is not None
 
     def _changes_proposal(self, text: str, pending: Proposal) -> bool:
-        """Whether a yes-message also asks to change the waiting proposal.
-
-        A plain "yes" keeps the proposal. Explicitly different items, a
-        different order or a different reason must start a new proposal instead
-        of silently acting on the old one.
-        """
         order_ids = nlu.extract_order_ids(text)
         if order_ids and pending.order_id not in order_ids:
             return True
@@ -1078,11 +1257,9 @@ class Assistant:
         if nlu.mentions_item_like(text) and any(
             word in normalized for word in ("just", "only", "instead", "not the")
         ):
-            if len(pending.item_ids) > 1:
-                return True
-            if pending.item_names:
+            for item_name in pending.item_names:
                 name_tokens = set(
-                    re.findall(r"[a-z0-9]+", " ".join(pending.item_names).lower())
+                    re.findall(r"[a-z0-9]+", item_name.lower())
                 )
                 text_tokens = set(re.findall(r"[a-z0-9]+", normalized))
                 if name_tokens & text_tokens:
@@ -1093,13 +1270,9 @@ class Assistant:
     def _is_policy_only(self, text: str, intents: dict) -> bool:
         normalized = nlu.normalize(text)
         has_specific = bool(intents["order_ids"] or intents["item_ids"])
-
-        # A general question about a rule is a policy question, even when it
-        # uses an action word ("Can I cancel after it has shipped?"). A
-        # possessive plus a concrete product ("my earbuds") points at the
-        # customer's own order, so that stays in the order-specific flow.
         possessive = bool(re.search(r"\b(my|our)\b", normalized))
         own_product = possessive and nlu.mentions_product(text)
+
         if not has_specific and not intents["action"] and nlu.is_question(text):
             if intents["cancel"]:
                 return True
@@ -1113,7 +1286,11 @@ class Assistant:
             ):
                 return True
 
-        if ("policy" in normalized or "policies" in normalized) and not intents["action"]:
+        if (
+            ("policy" in normalized or "policies" in normalized)
+            and not intents["action"]
+            and not intents["track"]
+        ):
             return True
         if intents["track"] or intents["order_ids"]:
             return False
@@ -1140,26 +1317,41 @@ class Assistant:
         ):
             if re.search(
                 r"\b(shipping|delivery|address|payment|refund|exchange|lost|"
-                r"delay|late|fee|cost|charge|tracking)\b",
+                r"delay|late|fee|cost|charge|tracking|plus)\b",
                 normalized,
             ):
                 return True
         return False
 
+    def _policy_question_text(self, text: str) -> str:
+        """Pick the policy half of a one-message tracking + policy request."""
+        parts = re.split(r"\s+and\s+", text, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 1:
+            return text
+        hint = re.compile(
+            r"\b(policy|policies|how many|how long|how much|window|warranty|"
+            r"refund|return|shipping|payment|address|fee|cost|exchange|"
+            r"covered|cover)\b",
+            re.IGNORECASE,
+        )
+        scores = [len(hint.findall(part)) for part in parts]
+        return parts[0] if scores[0] >= scores[1] else parts[1]
+
     def _select_policy_chunks(self, matches: list[dict]) -> list[dict]:
-        """Keep the answer focused: top paragraph, then a closely related one
-        from the same document when possible, else another strong match."""
         if not matches:
             return []
         top = matches[0]
         chosen = [top]
-        for item in matches[1:]:
-            if (
-                item["doc_id"] == top["doc_id"]
-                and item["score"] >= 0.5 * top["score"]
-            ):
-                chosen.append(item)
-                break
+        # Include closely-scoring sections from the same document; a policy
+        # answer often needs the rule and its exception (for example opened
+        # earbuds are covered by §3.1 and excluded again by §4.2).
+        same_doc = [
+            item
+            for item in matches[1:]
+            if item["doc_id"] == top["doc_id"]
+            and item["score"] >= 0.55 * top["score"]
+        ]
+        chosen.extend(same_doc[:2])
         if len(chosen) == 1:
             for item in matches[1:]:
                 if (
@@ -1171,14 +1363,11 @@ class Assistant:
         return chosen
 
     def _expand_policy_query(self, text: str) -> str:
-        """Add topic words so broad questions rank the substantive section.
-
-        This only rewrites the search query; no policy facts live here.
-        """
         normalized = nlu.normalize(text)
         additions: list[str] = []
         if "return" in normalized and any(
-            word in normalized for word in ("policy", "how many", "how long", "window")
+            word in normalized
+            for word in ("policy", "how many", "how long", "window")
         ):
             additions.append("return window days")
         if "refund" in normalized and any(
@@ -1188,21 +1377,59 @@ class Assistant:
             additions.append("refund processing business days")
         if "warranty" in normalized and "policy" in normalized:
             additions.append("warranty period months")
+        if "warranty" in normalized and any(
+            word in normalized
+            for word in ("how long", "period", "months", "length", "duration", "cover", "covered")
+        ):
+            additions.append("warranty period months")
         if "shipping" in normalized and any(
             word in normalized for word in ("policy", "fee", "cost", "how much")
         ):
             additions.append("shipping fee")
+        if any(
+            phrase in normalized
+            for phrase in ("outside india", "international", "ship abroad")
+        ):
+            additions.append("international shipping outside India")
+        if any(
+            word in normalized for word in ("payment", "pay", "upi", "paypal", "cod")
+        ):
+            additions.append(
+                "payment methods UPI credit debit cards net banking cash on delivery"
+            )
+        if "address" in normalized and any(
+            word in normalized for word in ("change", "update", "delivery")
+        ):
+            additions.append("change delivery address")
+        if "exchange" in normalized:
+            additions.append("exchange window")
+        if "opened" in normalized and "return" in normalized:
+            additions.append("opened earphones earbuds hygiene seal")
         if "cancel" in normalized:
             additions.append("cancel before shipment")
+        if "lost" in normalized or "parcel" in normalized:
+            additions.append("lost parcel")
         return (text + " " + " ".join(additions)).strip()
 
     def _looks_like_fault(self, text: str) -> bool:
         normalized = nlu.normalize(text)
         return any(phrase in normalized for phrase in nlu.DEFECTIVE_PHRASES)
 
-    def _fault_summary(self, text: str) -> str:
-        cleaned = text.strip()
-        return cleaned[:200] if cleaned else "fault reported"
+    def _when_text(self, order: dict, days: int, window: int) -> str:
+        if days == 0:
+            return (
+                f"It was delivered today, which is within the {window}-day "
+                "return window."
+            )
+        if days == 1:
+            return (
+                f"It was delivered yesterday, which is within the {window}-day "
+                "return window."
+            )
+        return (
+            f"It was delivered on {format_date(order.get('delivery_date'))} "
+            f"({days} days ago), which is within the {window}-day return window."
+        )
 
     def _names(self, items: list[dict]) -> str:
         names = [item.get("name") or item.get("item_id", "item") for item in items]
@@ -1213,6 +1440,19 @@ class Assistant:
         if len(names) == 2:
             return f"{names[0]} and {names[1]}"
         return ", ".join(names[:-1]) + f" and {names[-1]}"
+
+    def _ask_which_item(self, order: dict) -> str:
+        listing = "; ".join(
+            f"{item['item_id']} — {item['name']}" for item in order["items"]
+        )
+        return (
+            f"Which item from order {order['order_id']} do you mean? "
+            f"It contains: {listing}."
+        )
+
+    def _asks_for_reason(self, text: str) -> bool:
+        normalized = nlu.normalize(text)
+        return "change of mind" in normalized or "defective" in normalized
 
     def _search(self, ctx: ToolContext, query: str, limit: int = 3) -> list[dict]:
         return ctx.search_policy(query, limit=limit)["results"]
@@ -1234,13 +1474,14 @@ class Assistant:
     def _quote_from(self, matches: list[dict], section: str) -> str:
         for item in matches:
             if item["section"] == section:
-                return trim_sentences(item["text"], 300)
+                return trim_text(item["text"], 300)
         return ""
 
     def _cite(
         self,
         result: ChatResult,
         matches: list[dict],
+        *,
         doc_ids: set[str] | None = None,
         max_items: int = 2,
         sections: set[str] | None = None,
@@ -1275,14 +1516,12 @@ class Assistant:
         result.pending_confirmation = False
         return result
 
-    def _out_of_scope(self, result: ChatResult) -> ChatResult:
-        result.route = "out_of_scope"
-        result.citations = []
-        result.tool_calls = []
-        result.pending_confirmation = False
-        result.answer = (
-            "I can only help with ShopSphere orders and policies. I can track an "
-            "order, start a return, check warranty cover, cancel an order, or "
-            "explain a store policy."
+    def _out_of_scope(self) -> ChatResult:
+        return ChatResult(
+            answer=(
+                "I can only help with ShopSphere orders and policies. I can track "
+                "an order, start a return, check warranty cover, cancel an order, "
+                "or explain a store policy."
+            ),
+            route="out_of_scope",
         )
-        return result

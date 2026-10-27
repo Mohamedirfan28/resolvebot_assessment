@@ -1,8 +1,8 @@
-"""The five tools the assistant may use.
+"""The five ShopSphere tools.
 
-Every tool takes the customer ID from the request context (the HTTP header),
-never from the model. Order-owning tools return ORDER_NOT_FOUND both for a
-missing order and for someone else's order so existence cannot be probed.
+Tools take the customer identity from the request context, never from model
+arguments. An order that belongs to another customer is indistinguishable from
+a missing order: both return ``ORDER_NOT_FOUND``.
 """
 
 from __future__ import annotations
@@ -10,18 +10,18 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 
-from . import repository, rules
-from .config import Settings
-from .policy_search import PolicyIndex
-from .util import parse_date
+from app.core.config import Settings
+from app.db import repository
+from app.services import rules
+from app.services.policy_search import PolicyIndex
 
 
 class ToolLimitExceeded(RuntimeError):
-    """Raised when a single message tries to use more tools than allowed."""
+    """Raised when a single message uses more tool calls than allowed."""
 
 
 class ToolContext:
-    """One instance per /chat request. Keeps a log of every tool call."""
+    """Per-request tool executor and tool-call log."""
 
     def __init__(
         self,
@@ -42,7 +42,7 @@ class ToolContext:
         )
         self.calls: list[dict] = []
 
-    # ------------------------------------------------------------- logging
+    # --------------------------------------------------------------- logging
     def _log(
         self,
         name: str,
@@ -52,7 +52,7 @@ class ToolContext:
     ) -> None:
         if len(self.calls) >= self.max_tool_calls:
             raise ToolLimitExceeded
-        entry = {"name": name, "args": args, "status": status}
+        entry: dict = {"name": name, "args": args, "status": status}
         if error_code:
             entry["error_code"] = error_code
         self.calls.append(entry)
@@ -62,11 +62,15 @@ class ToolContext:
         return {"error_code": code, "message": message}
 
     def log_pending(self, name: str, args: dict) -> None:
-        """Record a proposal that is waiting for the customer's yes."""
         self._log(name, args, status="pending_confirmation")
 
-    # --------------------------------------------------------------- tools
-    def get_orders(self, order_id: str | None = None, status: str | None = None) -> dict:
+    def log_error(self, name: str, args: dict, code: str) -> None:
+        self._log(name, args, status="error", error_code=code)
+
+    # ---------------------------------------------------------------- tools
+    def get_orders(
+        self, order_id: str | None = None, status: str | None = None
+    ) -> dict:
         args: dict = {}
         if order_id:
             args["order_id"] = order_id
@@ -78,16 +82,21 @@ class ToolContext:
         )
         if order_id and not orders:
             return self._error(
-                "get_orders", args, "ORDER_NOT_FOUND", "Order not found on this account"
+                "get_orders",
+                args,
+                "ORDER_NOT_FOUND",
+                "Order not found on this account",
             )
-
-        enriched = [rules.enrich_order(order, self.today, self.params) for order in orders]
+        enriched = [
+            rules.enrich_order(order, self.today, self.params)
+            for order in orders
+        ]
         self._log("get_orders", args)
         return {"orders": enriched}
 
     def search_policy(self, query: str, limit: int = 3) -> dict:
         args = {"query": query}
-        results = self.index.search(query, limit=limit)
+        matches = self.index.search(query, limit=max(1, min(limit, 6)))
         self._log("search_policy", args)
         return {
             "results": [
@@ -100,7 +109,7 @@ class ToolContext:
                     "effective_date": item.chunk.effective_date.isoformat(),
                     "score": item.score,
                 }
-                for item in results
+                for item in matches
             ]
         }
 
@@ -111,10 +120,11 @@ class ToolContext:
         order = self._get_order(order_id)
         if order is None:
             return self._error(
-                "check_return_eligibility", args, "ORDER_NOT_FOUND",
+                "check_return_eligibility",
+                args,
+                "ORDER_NOT_FOUND",
                 "Order not found on this account",
             )
-
         result = rules.evaluate_return(order, item_ids, reason, self.params)
         if result.get("eligible"):
             self._log("check_return_eligibility", args)
@@ -134,17 +144,21 @@ class ToolContext:
         order = self._get_order(order_id)
         if order is None:
             return self._error(
-                "create_return_request", args, "ORDER_NOT_FOUND",
+                "create_return_request",
+                args,
+                "ORDER_NOT_FOUND",
                 "Order not found on this account",
             )
-
-        # Re-check immediately before writing.
+        # Re-check immediately before writing; never trust a model's earlier
+        # eligibility claim.
         result = rules.evaluate_return(order, item_ids, reason, self.params)
         if not result.get("eligible"):
             return self._error(
-                "create_return_request", args, result["error_code"], result["message"]
+                "create_return_request",
+                args,
+                result["error_code"],
+                result["message"],
             )
-
         request_id = repository.insert_return_request(
             self.conn, self.customer_id, order_id, item_ids, reason
         )
@@ -160,17 +174,24 @@ class ToolContext:
     def create_support_ticket(
         self, order_id: str, ticket_type: str, summary: str
     ) -> dict:
-        args = {"order_id": order_id, "ticket_type": ticket_type, "summary": summary}
-        if ticket_type not in {"warranty", "cancellation"}:
+        args = {
+            "order_id": order_id,
+            "ticket_type": ticket_type,
+            "summary": summary,
+        }
+        if ticket_type not in rules.VALID_TICKET_TYPES:
             return self._error(
-                "create_support_ticket", args, "INVALID_TICKET_TYPE",
+                "create_support_ticket",
+                args,
+                "INVALID_TICKET_TYPE",
                 "ticket_type must be warranty or cancellation",
             )
-
         order = self._get_order(order_id)
         if order is None:
             return self._error(
-                "create_support_ticket", args, "ORDER_NOT_FOUND",
+                "create_support_ticket",
+                args,
+                "ORDER_NOT_FOUND",
                 "Order not found on this account",
             )
 
@@ -181,7 +202,10 @@ class ToolContext:
 
         if not check.get("eligible"):
             return self._error(
-                "create_support_ticket", args, check["error_code"], check["message"]
+                "create_support_ticket",
+                args,
+                check["error_code"],
+                check["message"],
             )
 
         ticket_id = repository.insert_support_ticket(
@@ -195,23 +219,22 @@ class ToolContext:
             "status": "open",
         }
 
-    # ------------------------------------------------------------- helpers
+    # -------------------------------------------------------------- helpers
     def _get_order(self, order_id: str) -> dict | None:
-        """Ownership is enforced here: a foreign order is simply absent."""
-        orders = repository.fetch_orders(self.conn, self.customer_id, order_id=order_id)
+        orders = repository.fetch_orders(
+            self.conn, self.customer_id, order_id=order_id
+        )
         if not orders:
             return None
         return rules.enrich_order(orders[0], self.today, self.params)
 
     def lookup_order(self, order_id: str) -> dict | None:
-        """Read-only owner-scoped lookup used before proposing a write."""
+        """Owner-scoped lookup used by the planner before proposing a write."""
         return self._get_order(order_id)
 
     def all_orders(self) -> list[dict]:
-        """Read helper used by the planner for disambiguation (not a tool)."""
         orders = repository.fetch_orders(self.conn, self.customer_id)
-        return [rules.enrich_order(order, self.today, self.params) for order in orders]
-
-    def order_delivery_date(self, order: dict):
-        shipment = order.get("shipment") or {}
-        return parse_date(shipment.get("delivered_at"))
+        return [
+            rules.enrich_order(order, self.today, self.params)
+            for order in orders
+        ]
