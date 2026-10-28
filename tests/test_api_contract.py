@@ -24,6 +24,16 @@ def test_health(api):
     assert body["policy_sections"] > 40
 
 
+def test_root_redirects_to_api_docs(api):
+    response = api.client.get("/", follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["location"] == "/docs/"
+
+    docs = api.client.get("/docs/")
+    assert docs.status_code == 200
+    assert "ResolveBot" in docs.text
+
+
 def test_missing_customer_header_is_401(api):
     response = api.client.post(
         "/chat", json={"session_id": "s", "message": "Where is my order?"}

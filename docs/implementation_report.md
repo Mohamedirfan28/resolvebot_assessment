@@ -13,7 +13,7 @@ delivery includes:
 - clarification and propose/confirm conversation handling with no-write
   guarantees;
 - an optional LLM tool loop with write interception and deterministic fallback;
-- 83 automated tests;
+- 84 automated tests;
 - README, `.env.example`, API specification, architecture, requirements analysis
   and this report.
 
@@ -37,7 +37,7 @@ app/services/tools.py               Five tools and tool-call log
 app/services/sessions.py            Sessions and pending proposals
 app/services/assistant.py           Deterministic planner
 app/services/agent.py               Optional LLM providers and tool loop
-tests/                              83 tests with temporary DB copies
+tests/                              84 tests with temporary DB copies
 docs/                               Design and API documentation
 requirements.txt, requirements-dev.txt, .env.example, pytest.ini
 
@@ -85,7 +85,7 @@ python -m pytest
 Result:
 
 ```text
-83 passed
+84 passed
 ```
 
 Breakdown:
@@ -93,12 +93,12 @@ Breakdown:
 | File | Tests | Coverage area |
 |---|---:|---|
 | `tests/test_agent.py` | 8 | Scripted LLM tool loop, write interception, fallback |
-| `tests/test_api_contract.py` | 12 | Response shape, routes, 400/401/403, 200 business errors |
+| `tests/test_api_contract.py` | 13 | Response shape, root docs redirect, routes, 400/401/403, 200 business errors |
 | `tests/test_business_rules.py` | 20 | Return order, boundary, warranty, cancellation, parameter overrides |
 | `tests/test_conversation.py` | 19 | Clarification, confirmation, abandonment, combined intents, no-write safety |
 | `tests/test_policy_search.py` | 9 | Manifest filtering, superseded/future, citations, coverage |
 | `tests/test_tools.py` | 15 | Owner scoping, error codes, writes and re-checks |
-| **Total** | **83** | |
+| **Total** | **84** | |
 
 Every test that needs the database copies `data/shopsphere.db` into a pytest
 temporary directory (`tests/conftest.py`). The supplied database is never opened

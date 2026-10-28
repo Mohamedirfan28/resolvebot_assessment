@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.requests import Request
 
 from app import __version__
@@ -50,6 +50,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(
         title="ResolveBot",
+        docs_url="/docs/",
         description=(
             "Customer-support chat assistant for ShopSphere. It looks up the "
             "authenticated customer's orders, answers policy questions with "
@@ -60,6 +61,10 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         contact={"name": "ShopSphere Support", "email": "support@shopsphere.example.com"},
     )
+
+    @app.get("/", include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse(url="/docs/")
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(

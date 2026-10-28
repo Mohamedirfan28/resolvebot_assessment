@@ -28,8 +28,9 @@ pip install -r requirements.txt
 uvicorn main:app --port 8000
 ```
 
-Open `http://127.0.0.1:8000/health` to confirm startup. Interactive API docs are
-at `http://127.0.0.1:8000/docs`.
+Open `http://127.0.0.1:8000` to view the interactive API docs; it redirects to
+`http://127.0.0.1:8000/docs/`. Open `http://127.0.0.1:8000/health` to confirm
+startup.
 
 You can also run `python main.py`; it reads `HOST` and `PORT` from the
 environment (defaults `0.0.0.0:8000`).
@@ -47,6 +48,7 @@ variables take precedence over `.env`.
 | `APP_TODAY` | `2026-07-01` | Business "today"; the machine clock is never used |
 | `LLM_PROVIDER` | `none` | `none`, `openai`, `anthropic` or `google` |
 | `LLM_AGENT` | `auto` | `auto`, `always` or `never` |
+| `LLM_POLISH` | `false` | Optionally polish deterministic replies with the configured LLM |
 | `LLM_MODEL` | provider default | Model name override |
 | `LLM_BASE_URL` | provider default | OpenAI-compatible base URL override |
 | `<PROVIDER>_API_KEY` | empty | For example `OPENAI_API_KEY` |
@@ -328,7 +330,7 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-Current result: **83 passed** across business rules, policy retrieval, tools,
+Current result: **84 passed** across business rules, policy retrieval, tools,
 HTTP contract, conversation safety and the optional agent path.
 
 | Test file | Focus |
